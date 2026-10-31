@@ -35,7 +35,7 @@ Grab the latest build from the **Releases** page. Windows needs no installer, ju
 
 ## Windows
 
-Requires Windows 10 or 11. Run `HDRUltimate.exe`, then look for the icon in the system tray. Open Settings from the tray menu to add games and set hotkeys.
+Requires Windows 10 or 11. Run the downloaded `.exe` (for example `HDRUltimate1.0.exe`), then look for the icon in the system tray. Open Settings from the tray menu to add games and set hotkeys.
 
 ### Build from source
 
