@@ -1,0 +1,28 @@
+# Built files
+*.exe
+*.pdb
+builds/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Secrets: never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+secrets.*
+credentials.*
+
+# Local settings and logs
+config.txt
+config.json
+log.txt
+*.log
+.claude/

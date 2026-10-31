@@ -1,2 +1,13 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Keep Unix line endings on files that run on Linux
+*.sh text eol=lf
+*.py text eol=lf
+linux/** text eol=lf
+
+# Windows build files keep CRLF
+*.cmd text eol=crlf
+*.cs text
+
+# Binary files Git must not touch
+*.ttf binary
+*.ico binary
+*.exe binary
