@@ -72,7 +72,7 @@ class Game:
     restore: bool = True        # turn HDR back off when the game closes
     ask: bool = True            # ask before turning HDR on
     skip_if_off: bool = False   # don't offer HDR when the game's own HDR option is off
-    oled_care: bool = False     # turn HDR off while tabbed out of the game
+    oled_care: bool = True      # turn HDR off while tabbed out of the game
     monitors: dict = field(default_factory=dict)  # connector -> display name
 
     @property
@@ -86,7 +86,8 @@ class Config:
     games_enabled: bool = True
     theme: str = "system"       # system | light | dark
     startup_asked: bool = False
-    oled_enabled: bool = True   # master switch; games still opt in one by one
+    oled_asked: bool = False
+    oled_enabled: bool = False  # master switch, offered on first run; each game can still opt out
     oled_minutes: int = 5       # minutes tabbed out before OLED care turns HDR off
     games: list = field(default_factory=list)
 
@@ -1318,6 +1319,8 @@ def run_ui(args):
 
             if not cfg.startup_asked and not Build.dev():
                 self.ask_startup()
+            if not cfg.oled_asked and not Build.dev():
+                self.ask_oled()
             # Without a tray (stock GNOME has none) Settings is the only way in.
             if not QSystemTrayIcon.isSystemTrayAvailable() or not cfg.games:
                 self.open_settings()
@@ -1329,6 +1332,16 @@ def run_ui(args):
             if answer == QMessageBox.StandardButton.Yes:
                 Startup.set(True)
             cfg.startup_asked = True
+            cfg.save()
+
+        def ask_oled(self):
+            answer = QMessageBox.question(
+                None, Build.name(),
+                "Turn on OLED care?\n\nIt turns HDR off on a game's monitors after you've been tabbed out of it "
+                "for a few minutes, and back on when you return, to help prevent burn-in. "
+                "You can change this any time under Settings > OLED care.")
+            cfg.oled_enabled = answer == QMessageBox.StandardButton.Yes
+            cfg.oled_asked = True
             cfg.save()
 
         def tick(self):

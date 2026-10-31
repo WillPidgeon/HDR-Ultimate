@@ -11,7 +11,7 @@ import hdr_ultimate as h
 
 h.Build.channel, h.Build.fake = "dev", True
 h.Build.dir().mkdir(parents=True, exist_ok=True)
-(h.Build.dir() / "config.json").write_text(json.dumps({"startup_asked": True, "games": [
+(h.Build.dir() / "config.json").write_text(json.dumps({"startup_asked": True, "oled_asked": True, "oled_enabled": True, "games": [
     {"exe": "/g/auto/Auto.exe", "name": "Auto Game", "ask": False, "oled_care": True, "monitors": {"DP-1": "Test OLED"}},
     {"exe": "/g/ask/Ask.exe", "name": "Ask Game", "monitors": {"DP-2": "Test LCD"}}]}))
 failures = []

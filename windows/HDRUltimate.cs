@@ -347,7 +347,7 @@ namespace HdrUltimate
         public bool Restore = true;     // turn HDR back off when the game closes
         public bool Ask = true;         // ask before turning HDR on
         public bool SkipIfOff;          // don't offer HDR when the game's own HDR option is off
-        public bool OledCare;           // turn HDR off while tabbed out of the game
+        public bool OledCare = true;    // turn HDR off while tabbed out of the game
         public Dictionary<string, string> Monitors = new Dictionary<string, string>();
 
         public static string NameFor(string exe)
@@ -367,11 +367,11 @@ namespace HdrUltimate
     {
         public List<Binding> Bindings = new List<Binding>();
         public List<Game> Games = new List<Game>();
-        public bool ShowOsd = true, GamesEnabled = true, StartupAsked, OfferDefaultApplied;
+        public bool ShowOsd = true, GamesEnabled = true, StartupAsked, OfferDefaultApplied, OledDefaultApplied, OledAsked;
         public string Theme = "system"; // system | light | dark
         public const int OledMinMinutes = 1, OledMaxMinutes = 30;
         public int OledMinutes = 5;     // minutes tabbed out before OLED care turns HDR off
-        public bool OledEnabled = true; // master switch; games still opt in one by one
+        public bool OledEnabled;        // master switch, offered on first run; each game can still opt out
 
         static string AppData { get { return Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); } }
         public static string Dir { get { return Path.Combine(AppData, Build.Name); } }
@@ -389,7 +389,12 @@ namespace HdrUltimate
                     Directory.CreateDirectory(Dir);
                     File.Copy(old, FilePath);
                 }
-                if (!File.Exists(FilePath)) return c;
+                if (!File.Exists(FilePath))
+                {
+                    // New installs already have the current defaults; the one-time upgrades below are for old configs.
+                    c.OfferDefaultApplied = c.OledDefaultApplied = true;
+                    return c;
+                }
                 foreach (var line in File.ReadAllLines(FilePath))
                 {
                     var p = line.Split('\t');
@@ -398,6 +403,8 @@ namespace HdrUltimate
                     else if (p[0] == "theme" && p.Length > 1) c.Theme = p[1];
                     else if (p[0] == "startup_asked" && p.Length > 1) c.StartupAsked = p[1] == "1";
                     else if (p[0] == "offer_default" && p.Length > 1) c.OfferDefaultApplied = p[1] == "1";
+                    else if (p[0] == "oled_default" && p.Length > 1) c.OledDefaultApplied = p[1] == "1";
+                    else if (p[0] == "oled_asked" && p.Length > 1) c.OledAsked = p[1] == "1";
                     else if (p[0] == "oled_enabled" && p.Length > 1) c.OledEnabled = p[1] == "1";
                     else if (p[0] == "oled_minutes" && p.Length > 1)
                         c.OledMinutes = Math.Max(OledMinMinutes, Math.Min(OledMaxMinutes, int.Parse(p[1])));
@@ -441,6 +448,13 @@ namespace HdrUltimate
                     c.OfferDefaultApplied = true;
                     c.Save();
                 }
+                // OLED care now covers every game once it's turned on; applied once, like the above.
+                if (!c.OledDefaultApplied)
+                {
+                    foreach (var g in c.Games) g.OledCare = true;
+                    c.OledDefaultApplied = true;
+                    c.Save();
+                }
             }
             catch (Exception ex) { MessageBox.Show("Could not read config: " + ex.Message, Build.Name); }
             return c;
@@ -469,6 +483,8 @@ namespace HdrUltimate
             sb.AppendLine("theme\t" + Theme);
             sb.AppendLine("startup_asked\t" + (StartupAsked ? "1" : "0"));
             sb.AppendLine("offer_default\t" + (OfferDefaultApplied ? "1" : "0"));
+            sb.AppendLine("oled_default\t" + (OledDefaultApplied ? "1" : "0"));
+            sb.AppendLine("oled_asked\t" + (OledAsked ? "1" : "0"));
             sb.AppendLine("oled_enabled\t" + (OledEnabled ? "1" : "0"));
             sb.AppendLine("oled_minutes\t" + OledMinutes);
             foreach (var b in Bindings)
@@ -846,6 +862,17 @@ namespace HdrUltimate
                 cfg.Save();
             }
             else Startup.RefreshPath();
+
+            if (!cfg.OledAsked && !Build.Dev)
+            {
+                using (var prompt = new StartupPrompt("Turn on OLED care?",
+                    "OLED care turns HDR off on a game's monitors after you've been tabbed out of it for a few minutes, " +
+                    "and back on when you return, to help prevent burn-in. You can change this any time under Settings > OLED care.",
+                    "Turn on OLED care"))
+                    cfg.OledEnabled = prompt.ShowDialog() == DialogResult.Yes;
+                cfg.OledAsked = true;
+                cfg.Save();
+            }
 
             var failed = RegisterAll();
             if (cfg.Bindings.Count == 0 && cfg.Games.Count == 0) OpenSettings();
@@ -1845,6 +1872,12 @@ namespace HdrUltimate
     class StartupPrompt : ThemedForm
     {
         public StartupPrompt()
+            : this("Start HDR Ultimate with Windows?",
+                   "Hotkeys and game detection only work while HDR Ultimate is running in the tray. You can change this any time under Settings.",
+                   "Yes, start with Windows") { }
+
+        // A first-run yes/no question; Yes returns DialogResult.Yes.
+        public StartupPrompt(string question, string detail, string yesText)
         {
             Text = Build.Name;
             Icon = AppIcon.Get();
@@ -1855,14 +1888,16 @@ namespace HdrUltimate
             TopMost = true;
             ClientSize = new Size(460, 180);
 
-            var title = new HeaderLabel { Text = "Start HDR Ultimate with Windows?", Font = HeaderFont.Get(13f), Location = new Point(18, 14), Size = new Size(424, 32), AutoEllipsis = true };
+            var title = new HeaderLabel { Text = question, Font = HeaderFont.Get(13f), Location = new Point(18, 14), Size = new Size(424, 32), AutoEllipsis = true };
+            int textHeight = TextRenderer.MeasureText(detail, Font, new Size(424, 0), TextFormatFlags.WordBreak).Height;
             var body = new Label
             {
-                Text = "Hotkeys and game detection only work while HDR Ultimate is running in the tray. You can change this any time under Settings.",
-                Location = new Point(18, 52), Size = new Size(424, 66), Tag = "muted"
+                Text = detail,
+                Location = new Point(18, 52), Size = new Size(424, Math.Max(66, textHeight + 6)), Tag = "muted"
             };
+            ClientSize = new Size(460, body.Bottom + 62);
             var row = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 52, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(10) };
-            var yes = new Button { Text = "Yes, start with Windows", AutoSize = true, Tag = "primary", DialogResult = DialogResult.Yes };
+            var yes = new Button { Text = yesText, AutoSize = true, Tag = "primary", DialogResult = DialogResult.Yes };
             var no = new Button { Text = "Not now", AutoSize = true, DialogResult = DialogResult.No };
             row.Controls.AddRange(new Control[] { yes, no });
             Controls.AddRange(new Control[] { title, body, row });
