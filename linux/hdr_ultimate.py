@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 OLED_MIN_MINUTES, OLED_MAX_MINUTES = 1, 30
 ICON_NAME = "hdr-ultimate"
 

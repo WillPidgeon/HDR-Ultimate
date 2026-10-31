@@ -18,14 +18,14 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle(HdrUltimate.Build.Name)]
 [assembly: System.Reflection.AssemblyProduct(HdrUltimate.Build.Name)]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion(HdrUltimate.Build.Version + ".0")]
 
 namespace HdrUltimate
 {
     // Each channel has its own name, settings folder and startup entry, so builds never touch each other's data.
     static class Build
     {
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
 #if DEV
         public const string Name = "HDR Ultimate Dev", Channel = "dev", RunName = "HDRUltimateDev", OldRunName = RunName;
         public const bool Dev = true, Release = false, InGameHdrColumn = true;
