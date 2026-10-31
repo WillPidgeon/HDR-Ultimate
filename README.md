@@ -69,6 +69,12 @@ linux/     Python source, installer and tests
 assets/    screenshots
 ```
 
+## License
+
+HDR Ultimate is free software, licensed under the [GNU General Public License v3.0](LICENSE). You can use, study, share and modify it, but any version you distribute must also be released under the GPL with its source code.
+
+Copyright (c) 2026 William Pidgeon
+
 ## Credits
 
 The interface uses the [Orbitron](https://fonts.google.com/specimen/Orbitron) font, licensed under the SIL Open Font License.
