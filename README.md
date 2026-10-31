@@ -17,6 +17,18 @@ A lightweight system-tray app for per-monitor HDR control on Windows 10/11 and L
 
 - You can contact me through this discord server for any bug reports or requests. [text](https://discord.gg/CsxstrtyVS)
 
+## Support the project
+
+HDR Ultimate is a personal project. If it's useful to you, donations are appreciated but never expected.
+
+| Coin | Address |
+| --- | --- |
+| Bitcoin (BTC) | `bc1qeaxzwgxluv7cqd0vycfvev2djm233m8nk9f7yx` |
+| Ethereum (ETH) | `0xBFB1fac92565B9B2A995D8bAb9B677fE8d9AB94F` |
+| XRP | `rKXSrHt2i6n4qPqgkQwWMhJVhW9A9PDX6R` |
+
+Crypto transactions can't be reversed. Double-check the address and the network before you send.
+
 ## Download
 
 Grab the latest build from the **Releases** page. Windows needs no installer, just run the `.exe`. Linux ships as a `.tar.gz`.
@@ -56,18 +68,6 @@ windows/   C# source, icon and build script
 linux/     Python source, installer and tests
 assets/    screenshots
 ```
-
-## Support the project
-
-HDR Ultimate is a personal project. If it's useful to you, donations are appreciated but never expected.
-
-| Coin | Address |
-| --- | --- |
-| Bitcoin (BTC) | `bc1qeaxzwgxluv7cqd0vycfvev2djm233m8nk9f7yx` |
-| Ethereum (ETH) | `0xBFB1fac92565B9B2A995D8bAb9B677fE8d9AB94F` |
-| XRP | `rKXSrHt2i6n4qPqgkQwWMhJVhW9A9PDX6R` |
-
-Crypto transactions can't be reversed. Double-check the address and the network before you send.
 
 ## Credits
 
