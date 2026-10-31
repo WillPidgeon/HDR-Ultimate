@@ -13,6 +13,10 @@ A lightweight system-tray app for per-monitor HDR control on Windows 10/11 and L
 - **Banner and on-screen confirmations** that never steal focus
 - **Light and dark themes**
 
+## Contact
+
+- You can contact me through this discord server for any bug reports or requests. [text](https://discord.gg/CsxstrtyVS)
+
 ## Download
 
 Grab the latest build from the **Releases** page. Windows needs no installer, just run the `.exe`. Linux ships as a `.tar.gz`.
