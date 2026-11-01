@@ -16,6 +16,7 @@ A lightweight system-tray app for per-monitor HDR control on Windows 10/11 and L
 ## Contact
 
 - You can contact me through this discord server for any bug reports or requests [here.](https://discord.gg/CsxstrtyVS)
+- Website: [hdrultra.help](https://hdrultra.help)
 
 ## Support the project
 
