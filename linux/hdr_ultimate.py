@@ -16,13 +16,15 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
+import urllib.request
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 OLED_MIN_MINUTES, OLED_MAX_MINUTES = 1, 30
 ICON_NAME = "hdr-ultimate"
 
@@ -74,10 +76,24 @@ class Game:
     skip_if_off: bool = False   # don't offer HDR when the game's own HDR option is off
     oled_care: bool = True      # turn HDR off while tabbed out of the game
     monitors: dict = field(default_factory=dict)  # connector -> display name
+    # Display mode while the game runs, on one monitor. Blank monitor = leave it; zero = keep that part.
+    mode_monitor: str = ""
+    mode_width: int = 0
+    mode_height: int = 0
+    mode_hz: int = 0
+    mode_in_game: bool = False  # resolution goes in the game's settings file instead of the desktop
 
     @property
     def exe_file(self):
         return file_name(self.exe)
+
+    @property
+    def has_mode(self):
+        return bool(self.mode_monitor) and (self.mode_width > 0 or self.mode_hz > 0)
+
+    @property
+    def desktop_size(self):
+        return (0, 0) if self.mode_in_game else (self.mode_width, self.mode_height)
 
 
 @dataclass
@@ -89,6 +105,9 @@ class Config:
     oled_asked: bool = False
     oled_enabled: bool = False  # master switch, offered on first run; each game can still opt out
     oled_minutes: int = 5       # minutes tabbed out before OLED care turns HDR off
+    usage_enabled: bool = True  # daily check-in for the active user count; opt-out offered on first run
+    usage_asked: bool = False
+    usage_day: str = ""         # UTC date of the last check-in
     games: list = field(default_factory=list)
 
     @staticmethod
@@ -121,6 +140,48 @@ class Config:
         temp.replace(self.path())
 
 
+class Usage:
+    """Active user count: one empty check-in per day, with nothing that identifies the user or PC.
+    The server (website/functions/ping.js) only adds one to that day's total."""
+    ENDPOINT = "https://hdrultra.help/ping"  # blank = no check-ins, and nothing is offered
+    TEST_VARIABLE = "HDRULTIMATE_USAGE_TEST_URL"  # test builds only check in to a test server named here
+
+    def __init__(self):
+        self.next_try, self.sending, self.sent_day = 0.0, False, None
+
+    @classmethod
+    def offered(cls):
+        return Build.channel == "release" and bool(cls.ENDPOINT)
+
+    @classmethod
+    def url(cls):
+        return cls.ENDPOINT if Build.channel == "release" else os.environ.get(cls.TEST_VARIABLE, "")
+
+    def tick(self, config):
+        """From the poll timer: at most one check-in per UTC day, retrying every 30 minutes while offline."""
+        if self.sent_day:  # a check-in finished on its thread
+            config.usage_day, self.sent_day = self.sent_day, None
+            config.save()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if not self.url() or not config.usage_enabled or not config.usage_asked or config.usage_day == today \
+                or self.sending or time.monotonic() < self.next_try:
+            return
+        self.sending, self.next_try = True, time.monotonic() + 30 * 60
+        threading.Thread(target=self.send, args=(self.url(), today), daemon=True).start()
+
+    def send(self, url, today):
+        try:
+            request = urllib.request.Request(url, data=b"", method="POST", headers={"User-Agent": "HDRUltimate"})
+            with urllib.request.urlopen(request, timeout=15) as reply:
+                log("Usage check-in: %d" % reply.status)
+                # Only the counter answers 204; a parking page or Wi-Fi sign-in page answering 200 doesn't count.
+                if reply.status == 204:
+                    self.sent_day = today
+        except (OSError, ValueError) as ex:
+            log("Usage check-in failed: " + str(ex))
+        self.sending = False
+
+
 def file_name(path):
     """Last path part, for both Unix paths and the Windows paths Proton uses."""
     return re.split(r"[\\/]", path or "")[-1]
@@ -139,6 +200,28 @@ class Monitor:
     name: str
     hdr_supported: bool = False
     hdr_on: bool = False
+    modes: list = field(default_factory=list)     # (width, height, hz), largest and fastest first
+    current: tuple = None                         # (width, height, hz)
+    mode_ids: dict = field(default_factory=dict)  # (width, height, hz) -> the desktop's own mode id
+
+
+def sort_modes(modes):
+    return sorted(set(modes), key=lambda m: (m[0] * m[1], m[0], m[2]), reverse=True)
+
+
+def pick_mode(monitor, width, height, hz):
+    """The mode to switch to; zero keeps that part. A new resolution keeps the current refresh rate if it has it,
+    otherwise its fastest. None if the monitor doesn't offer it."""
+    if not monitor.current:
+        return None
+    w, h = (width, height) if width > 0 else monitor.current[:2]
+    rates = [m[2] for m in monitor.modes if m[:2] == (w, h)]
+    rate = hz if hz > 0 else monitor.current[2] if monitor.current[2] in rates else max(rates, default=0)
+    return (w, h, rate) if rate in rates else None
+
+
+def describe_mode(width, height, hz):
+    return " @ ".join(p for p in ("%d × %d" % (width, height) if width > 0 else "", "%d Hz" % hz if hz > 0 else "") if p)
 
 
 def edid_name(connector):
@@ -176,6 +259,14 @@ class KdeBackend:
             if state and current:
                 current.hdr_supported = state.group(1) != "incapable"
                 current.hdr_on = state.group(1) == "enabled"
+            # Modes:  1:2560x1440@144*!  2:1920x1080@60   (* = current, ! = preferred)
+            if current and re.match(r"\s*Modes:", line):
+                for mode_id, w, h, hz, flags in re.findall(r"(\S+?):(\d+)x(\d+)@([\d.]+)([*!]*)", line):
+                    mode = (int(w), int(h), round(float(hz)))
+                    current.mode_ids.setdefault(mode, mode_id)
+                    if "*" in flags:
+                        current.current, current.mode_ids[mode] = mode, mode_id
+                current.modes = sort_modes(current.mode_ids)
         return found
 
     def monitors(self):
@@ -198,6 +289,15 @@ class KdeBackend:
             log("kscreen-doctor failed: " + str(ex))
             return False
 
+    def set_mode(self, monitor, mode):
+        try:
+            done = subprocess.run(["kscreen-doctor", "output.%s.mode.%s" % (monitor.id, monitor.mode_ids.get(mode, "%dx%d@%d" % mode))],
+                                  capture_output=True, text=True, timeout=10)
+            return done.returncode == 0
+        except (OSError, subprocess.SubprocessError) as ex:
+            log("kscreen-doctor failed: " + str(ex))
+            return False
+
 
 COLOR_DEFAULT, COLOR_BT2100 = 0, 1
 
@@ -205,37 +305,65 @@ COLOR_DEFAULT, COLOR_BT2100 = 0, 1
 def gnome_monitors(state):
     """Monitors from Mutter's GetCurrentState reply."""
     found = []
-    for spec, _modes, props in state[1]:
+    for spec, mode_list, props in state[1]:
         modes = props.get("supported-color-modes") or []
-        found.append(Monitor(spec[0], props.get("display-name") or spec[0], COLOR_BT2100 in modes,
-                             props.get("color-mode") == COLOR_BT2100))
+        m = Monitor(spec[0], props.get("display-name") or spec[0], COLOR_BT2100 in modes,
+                    props.get("color-mode") == COLOR_BT2100)
+        for mode_id, w, h, refresh, _scale, _scales, mode_props in mode_list:
+            mode = (w, h, round(refresh))
+            m.mode_ids.setdefault(mode, mode_id)
+            if mode_props.get("is-current"):
+                m.current, m.mode_ids[mode] = mode, mode_id
+        m.modes = sort_modes(m.mode_ids)
+        found.append(m)
     return found
 
 
-def gnome_config(state, connector, on, wrap_uint):
-    """Arguments for ApplyMonitorsConfig that keep the whole layout and change one monitor's colour mode.
+def gnome_config(state, connector, on, wrap_uint, mode_id=None):
+    """Arguments for ApplyMonitorsConfig that keep the whole layout and change one monitor's colour mode
+    (on = None keeps it) and/or its mode.
 
     Mutter replaces the entire configuration, so every monitor has to be listed with its current settings.
+    It also rejects gaps between monitors, so monitors right of or below a resized one move with its edge.
     """
     by_connector = {m[0][0]: m for m in state[1]}
-    logical = []
+    physical = state[3].get("layout-mode") == 2
+
+    def size(mode, scale, transform):
+        w, h = (mode[2], mode[1]) if transform % 2 else (mode[1], mode[2])  # odd transforms are rotated 90°
+        return (w, h) if physical else (round(w / scale), round(h / scale))
+
+    logical, resized = [], None
     for x, y, scale, transform, primary, specs, _props in state[2]:
         members = []
         for spec in specs:
             mon = by_connector[spec[0]]
-            mode = next((m[0] for m in mon[1] if m[6].get("is-current")), None)
-            if mode is None:
+            mode = current = next((m for m in mon[1] if m[6].get("is-current")), None)
+            if current is None:
                 raise ValueError("no current mode on " + spec[0])
+            if spec[0] == connector and mode_id is not None and mode_id != current[0]:
+                mode = next(m for m in mon[1] if m[0] == mode_id)
+                old = size(current, scale, transform)
+                if mode[5] and not any(abs(s - scale) < 0.01 for s in mode[5]):
+                    scale = min(mode[5], key=lambda s: abs(s - scale))
+                resized = (x, y, old, size(mode, scale, transform))
             options = {}
             for key in ("color-mode", "rgb-range"):
                 if key in mon[2]:
                     options[key] = wrap_uint(mon[2][key])
-            if spec[0] == connector:
+            if spec[0] == connector and on is not None:
                 options["color-mode"] = wrap_uint(COLOR_BT2100 if on else COLOR_DEFAULT)
-            members.append((spec[0], mode, options))
-        logical.append((x, y, scale, transform, primary, members))
+            members.append((spec[0], mode[0], options))
+        logical.append([x, y, scale, transform, primary, members])
+    if resized:
+        x0, y0, (ow, oh), (nw, nh) = resized
+        for lm in logical:
+            if lm[0] >= x0 + ow:
+                lm[0] += nw - ow
+            if lm[1] >= y0 + oh:
+                lm[1] += nh - oh
     props = {"layout-mode": wrap_uint(state[3]["layout-mode"])} if "layout-mode" in state[3] else {}
-    return state[0], 1, logical, props  # 1 = temporary: nothing to confirm, resets if monitors change
+    return state[0], 1, [tuple(lm) for lm in logical], props  # 1 = temporary: nothing to confirm, resets if monitors change
 
 
 class GnomeBackend:
@@ -261,25 +389,35 @@ class GnomeBackend:
             log("Mutter failed: " + str(ex))
             return []
 
-    def set_hdr(self, monitor, on):
+    def apply(self, monitor, on=None, mode_id=None):
         try:
-            config = gnome_config(self.call("GetCurrentState"), monitor.id, on, lambda v: self.GLib.Variant("u", v))
+            config = gnome_config(self.call("GetCurrentState"), monitor.id, on, lambda v: self.GLib.Variant("u", v), mode_id)
             self.call("ApplyMonitorsConfig", self.GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})", config))
             return True
         except Exception as ex:
             log("Mutter failed: " + str(ex))
             return False
 
+    def set_hdr(self, monitor, on):
+        return self.apply(monitor, on=on)
+
+    def set_mode(self, monitor, mode):
+        return mode in monitor.mode_ids and self.apply(monitor, mode_id=monitor.mode_ids[mode])
+
 
 class FakeBackend:
     desktop = "Simulated"
 
     def __init__(self):
+        modes = [(3840, 2160, 60), (2560, 1440, 144), (2560, 1440, 60), (1920, 1080, 144), (1920, 1080, 60)]
         self.list = [Monitor("DP-1", "Test OLED", True, False), Monitor("DP-2", "Test LCD", True, False),
                      Monitor("HDMI-A-1", "Old TV", False, False)]
+        for m in self.list:
+            m.modes, m.current = sort_modes(modes), (2560, 1440, 144)
+            m.mode_ids = {mode: "%dx%d@%d" % mode for mode in modes}
 
     def monitors(self):
-        return [Monitor(m.id, m.name, m.hdr_supported, m.hdr_on) for m in self.list]
+        return [Monitor(m.id, m.name, m.hdr_supported, m.hdr_on, list(m.modes), m.current, dict(m.mode_ids)) for m in self.list]
 
     def set_hdr(self, monitor, on):
         for m in self.list:
@@ -287,6 +425,13 @@ class FakeBackend:
                 m.hdr_on = on
         log("Set HDR %s on %s" % ("on" if on else "off", monitor.name))
         return True
+
+    def set_mode(self, monitor, mode):
+        for m in self.list:
+            if m.id == monitor.id and mode in m.modes:
+                m.current = mode
+                return True
+        return False
 
 
 class NoBackend:
@@ -296,6 +441,9 @@ class NoBackend:
         return []
 
     def set_hdr(self, monitor, on):
+        return False
+
+    def set_mode(self, monitor, mode):
         return False
 
 
@@ -551,6 +699,89 @@ class GameConfig:
         if re.fullmatch(r"-?\d+", value) and re.search("enable|use|output|mode|on$|toggle|active|^b?hdr$|hdr$", key):
             return int(value) != 0
         return None
+
+    # ---- In-game resolution
+
+    # "2560x1440" under a resolution setting: Cyberpunk's { "name": "Resolution", ..., "value": "2560x1440" }, or key = 2560x1440.
+    PAIRS = [re.compile(r'("name"\s*:\s*"[^"]*resolution[^"]*"[^{}]*?"value"\s*:\s*")(\d{3,5})(\s*[xX]\s*)(\d{3,5})', re.I),
+             re.compile(r'^([ \t]*"?[\w.]*resolution[\w.]*"?[ \t]*[:=][ \t]*"?)(\d{3,5})(\s*[xX]\s*)(\d{3,5})', re.I | re.M)]
+    # Separate width and height settings, group 2 = name, group 3 = number: RDR2's <screenWidth value="2560" />,
+    # Unreal's ResolutionSizeX=2560, and "name"/"value" JSON.
+    NUMBERS = [re.compile(r'(<([\w.]+)\b[^>]*?value\s*=\s*")(\d{3,5})(?=")', re.I),
+               re.compile(r'^([ \t]*"?([\w.]+)"?[ \t]*[:=][ \t]*"?)(\d{3,5})(?![\d.xX])', re.I | re.M),
+               re.compile(r'("name"\s*:\s*"([^"]+)"[^{}]*?"value"\s*:\s*)(\d{3,5})(?![\d.])', re.I)]
+
+    @staticmethod
+    def dimension(key):
+        """'w' or 'h' for a screen width/height setting, else None. Window positions, limits and render sizes don't count."""
+        key = key.lower()
+        if not re.search("screen|resolution|desired|display|fullscreen", key) or \
+                re.search("pos|min|max|hud|border|texture|shadow|render|scale|percent|index|offset|ratio|aspect|safe|fov", key):
+            return None
+        if re.search("width|sizex$|resx$|resolutionx$", key):
+            return "w"
+        if re.search("height|sizey$|resy$|resolutiony$", key):
+            return "h"
+        return None
+
+    @classmethod
+    def replace_resolution(cls, text, width, height):
+        """The text with every resolution setting rewritten, and how many there were (0 = none found)."""
+        found = 0
+
+        def pair(m):
+            nonlocal found
+            found += 1
+            return m.group(1) + str(width) + m.group(3) + str(height)
+
+        def number(m):
+            nonlocal found
+            d = cls.dimension(m.group(2))
+            if d is None or int(m.group(3)) < 320:
+                return m.group(0)
+            found += 1
+            return m.group(1) + str(width if d == "w" else height)
+
+        for pattern in cls.PAIRS:
+            text = pattern.sub(pair, text)
+        for pattern in cls.NUMBERS:
+            text = pattern.sub(number, text)
+        return text, found
+
+    @classmethod
+    def has_resolution(cls, path):
+        text = cls.read(path) if path and os.path.isfile(path) else None
+        return text is not None and cls.replace_resolution(text, 1, 1)[1] > 0
+
+    @classmethod
+    def set_resolution(cls, path, width, height):
+        """Writes the resolution into the game's settings file, keeping its encoding. The first write keeps a backup
+        next to it. Only call this while the game is closed: games rewrite their settings when they exit."""
+        try:
+            data = Path(path).read_bytes()
+            encoding = "utf-16" if data[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig" if data[:3] == b"\xef\xbb\xbf" else "utf-8"
+            before = data.decode(encoding)
+            after, found = cls.replace_resolution(before, width, height)
+            if not found:
+                log("No resolution setting in " + path)
+                return False
+            if after != before:
+                backup = path + ".hdrultimate.bak"
+                if not os.path.exists(backup):
+                    shutil.copy2(path, backup)
+                Path(path).write_bytes(after.encode(encoding))
+                log("Set in-game resolution %dx%d in %s" % (width, height, path))
+            return True
+        except (OSError, UnicodeError) as ex:
+            log("Couldn't set in-game resolution in %s: %s" % (path, ex))
+            return False
+
+    @classmethod
+    def apply_resolution(cls, game):
+        """Writes a game's chosen in-game resolution, if it has one. False when there's nothing to write or it failed."""
+        if not game.mode_in_game or game.mode_width <= 0 or not game.config or not os.path.isfile(game.config):
+            return False
+        return cls.set_resolution(game.config, game.mode_width, game.mode_height)
 
 
 # ------------------------------------------------------------------ Start at login
@@ -934,10 +1165,29 @@ def run_ui(args):
             self.if_off = self.choice(0 if game.skip_if_off else 1, "Leave HDR off", "Offer HDR anyway")
             self.on_close = self.choice(0 if game.restore else 1, "Turn HDR back off", "Leave HDR on")
             self.tabbed = self.choice(1 if game.oled_care else 0, "Keep HDR on", "Turn HDR off (OLED care)")
+            # Display mode: the monitor, then the resolutions and refresh rates it offers.
+            self.connected = connected
+            self.mode_ids = [m.id for m in connected]
+            labels = [m.name for m in connected]
+            if game.mode_monitor and game.mode_monitor not in self.mode_ids:
+                self.mode_ids.append(game.mode_monitor)
+                labels.append(game.monitors.get(game.mode_monitor, game.mode_monitor) + "  — not connected")
+            pick = next((i for i, k in enumerate(self.mode_ids) if k == game.mode_monitor or (not game.mode_monitor and k in selected)), 0)
+            self.mode_monitor = self.choice(0, *(labels or ["No monitors found"]))
+            self.mode_monitor.setCurrentIndex(pick)
+            self.resolution, self.refresh = QComboBox(), QComboBox()
+            self.apply_to = self.choice(1 if game.mode_in_game else 0, "Desktop", "In-game")
+            self.sizes, self.rates, self.modes, self.current = [], [], [], None
+            self.fill_sizes(game.mode_width, game.mode_height, game.mode_hz)
+            self.show_config()
+            self.mode_monitor.currentIndexChanged.connect(lambda _: self.fill_sizes(*self.selected_size(), self.selected_hz()))
+            self.resolution.currentIndexChanged.connect(lambda _: self.fill_rates(self.selected_hz()))
             for label, box in (("Name", self.name), ("Executable", self.exe), ("Monitors", self.monitors),
                                ("Game settings file", self.config), ("When the game starts", self.on_start),
                                ("If HDR is off in the game", self.if_off), ("When the game closes", self.on_close),
-                               ("When tabbed out", self.tabbed)):
+                               ("When tabbed out", self.tabbed), ("Display mode on", self.mode_monitor),
+                               ("Resolution", self.resolution), ("Resolution applies to", self.apply_to),
+                               ("Refresh rate", self.refresh)):
                 form.addRow(label, box)
             row = QHBoxLayout()
             row.addStretch(1)
@@ -957,6 +1207,39 @@ def run_ui(args):
             self.game.config = GameConfig.find(self.game) or ""
             on = GameConfig.enabled_in(self.game.config)
             self.config.setText((file_name(self.game.config) or "None found") + {True: "  ·  HDR on", False: "  ·  HDR off"}.get(on, ""))
+            if hasattr(self, "apply_to"):
+                self.apply_to.setItemText(1, "In-game" if GameConfig.has_resolution(self.game.config) else "In-game (not in settings file)")
+
+        def fill_sizes(self, width, height, hz):
+            """Keeps the given choices where the monitor offers them. A disconnected monitor just shows what was saved."""
+            key = self.mode_ids[self.mode_monitor.currentIndex()] if self.mode_ids else None
+            mon = next((m for m in self.connected if m.id == key), None)
+            self.modes = list(mon.modes) if mon else ([(width, height, hz)] if width > 0 or hz > 0 else [])
+            self.current = mon.current if mon else None
+            self.sizes = list(dict.fromkeys(m[:2] for m in self.modes if m[0] > 0))
+            self.resolution.blockSignals(True)
+            self.resolution.clear()
+            self.resolution.addItems(["Don't change"] + ["%d × %d" % s + ("  (current)" if self.current and s == self.current[:2] else "")
+                                                         for s in self.sizes])
+            self.resolution.setCurrentIndex(self.sizes.index((width, height)) + 1 if (width, height) in self.sizes else 0)
+            self.resolution.blockSignals(False)
+            self.fill_rates(hz)
+
+        def fill_rates(self, hz):
+            """The rates for the chosen resolution, or for the current one when it isn't changing."""
+            size = self.sizes[self.resolution.currentIndex() - 1] if self.resolution.currentIndex() > 0 else \
+                (self.current[:2] if self.current else None)
+            self.rates = sorted({m[2] for m in self.modes if m[2] > 0 and (size is None or m[:2] == size)}, reverse=True)
+            same = self.current is not None and size == self.current[:2]
+            self.refresh.clear()
+            self.refresh.addItems(["Don't change"] + ["%d Hz" % r + ("  (current)" if same and r == self.current[2] else "") for r in self.rates])
+            self.refresh.setCurrentIndex(self.rates.index(hz) + 1 if hz in self.rates else 0)
+
+        def selected_size(self):
+            return self.sizes[self.resolution.currentIndex() - 1] if self.resolution.currentIndex() > 0 else (0, 0)
+
+        def selected_hz(self):
+            return self.rates[self.refresh.currentIndex() - 1] if self.refresh.currentIndex() > 0 else 0
 
         def choose_exe(self):
             path = pick_exe(self, self.game.exe)
@@ -979,6 +1262,9 @@ def run_ui(args):
                 QMessageBox.information(self, self.windowTitle(), "Pick the game's executable first.")
             elif not self.monitors.chosen:
                 QMessageBox.information(self, self.windowTitle(), "Pick at least one monitor.")
+            elif self.apply_to.currentIndex() == 1 and self.resolution.currentIndex() > 0 and not GameConfig.has_resolution(self.game.config):
+                QMessageBox.information(self, self.windowTitle(), "The game's settings file has no resolution setting HDR Ultimate "
+                                        "can change. Choose Desktop, or pick the right file under Game settings file.")
             else:
                 g = self.game
                 g.name = self.name.text().strip() or game_name_for(g.exe)
@@ -987,6 +1273,9 @@ def run_ui(args):
                 g.skip_if_off = self.if_off.currentIndex() == 0
                 g.restore = self.on_close.currentIndex() == 0
                 g.oled_care = self.tabbed.currentIndex() == 1
+                (g.mode_width, g.mode_height), g.mode_hz = self.selected_size(), self.selected_hz()
+                g.mode_in_game = self.apply_to.currentIndex() == 1
+                g.mode_monitor = self.mode_ids[self.mode_monitor.currentIndex()] if g.mode_width or g.mode_hz else ""
                 self.accept()
 
     # ---------------------------------------------------------------- Settings
@@ -1100,6 +1389,8 @@ def run_ui(args):
                     line("On-screen notice", Toggle(cfg.show_osd, flag("show_osd"))),
                     line("Auto HDR for games", Toggle(cfg.games_enabled, flag("games_enabled"))),
                     muted("Desktop: " + self.a.backend.desktop)]
+            if Usage.offered():
+                rows.insert(4, line("Anonymous active user count", Toggle(cfg.usage_enabled, flag("usage_enabled"))))
             if Build.channel != "release":
                 rows.insert(4, line("Logs  (%s %s)" % (Build.channel, VERSION), button(
                     "Open folder", lambda: subprocess.Popen(["xdg-open", str(Build.dir())]))))
@@ -1236,6 +1527,9 @@ def run_ui(args):
                     cfg.games.append(dlg.game)
                 else:
                     cfg.games[index] = dlg.game
+                # A running game would overwrite it on exit; it's written when the game closes instead.
+                if dlg.game.exe_file.lower() not in running_exes([dlg.game]):
+                    GameConfig.apply_resolution(dlg.game)
                 self.saved()
 
         def cell_menu(self, row, col):
@@ -1287,9 +1581,11 @@ def run_ui(args):
             self.backend = pick_backend()
             self.focus = Focus()
             self.oled = OledCare()
+            self.usage = Usage()
             self.settings = None
             self.running = {}     # exe file name -> Game
             self.auto_on = {}     # monitor -> exe names holding it on
+            self.mode_set = {}    # monitor -> (mode to go back to, exe names holding the change)
             self.prompts = {}
             self.last_indicator = None
             for m in self.backend.monitors():
@@ -1310,6 +1606,7 @@ def run_ui(args):
             self.server.listen(socket_name)
             self.server.newConnection.connect(self.command)
 
+            app.aboutToQuit.connect(lambda: self.restore_modes(None))  # don't leave a game's display mode behind
             self.check_games()
             self.update_indicator()
             self.timer = QTimer(self)
@@ -1321,6 +1618,8 @@ def run_ui(args):
                 self.ask_startup()
             if not cfg.oled_asked and not Build.dev():
                 self.ask_oled()
+            if not cfg.usage_asked and Usage.offered():
+                self.ask_usage()
             # Without a tray (stock GNOME has none) Settings is the only way in.
             if not QSystemTrayIcon.isSystemTrayAvailable() or not cfg.games:
                 self.open_settings()
@@ -1344,10 +1643,25 @@ def run_ui(args):
             cfg.oled_asked = True
             cfg.save()
 
+        def ask_usage(self):
+            """On by default; this is the chance to opt out. No check-in goes out until it's answered."""
+            box = QMessageBox(QMessageBox.Icon.Question, Build.name(), "Anonymous active user count")
+            box.setInformativeText("HDR Ultimate checks in once a day, only to count how many people are using it. "
+                                   "Nothing about you, your PC, your games or your settings is sent. "
+                                   "You can turn this off any time under Settings.")
+            keep = box.addButton("Keep it on", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Opt out", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(keep)
+            box.exec()
+            cfg.usage_enabled = box.clickedButton() is keep
+            cfg.usage_asked = True
+            cfg.save()
+
         def tick(self):
             self.check_games()
             self.check_oled()
             self.update_indicator()
+            self.usage.tick(cfg)
 
         def command(self):
             sock = self.server.nextPendingConnection()
@@ -1447,6 +1761,7 @@ def run_ui(args):
 
         def game_started(self, g, key):
             log("Game started: %s (%s)" % (g.name, g.exe))
+            self.apply_mode(g, key)
             for path in g.monitors:
                 if path in self.auto_on:
                     self.auto_on[path].add(key)
@@ -1476,6 +1791,47 @@ def run_ui(args):
             self.prompts[key] = prompt
             prompt.present()
 
+        def apply_mode(self, g, key):
+            """Switches the game's monitor to its resolution and refresh rate. A monitor already in that mode
+            is left alone afterwards too, the same as HDR."""
+            width, height = g.desktop_size
+            if not g.has_mode or (width == 0 and g.mode_hz == 0):
+                return  # in-game resolution only: written when the game closes
+            m = next((x for x in self.backend.monitors() if x.id == g.mode_monitor), None)
+            if not m:
+                log("Display mode for %s: monitor not connected" % g.name)
+                return
+            mode = pick_mode(m, width, height, g.mode_hz)
+            if mode is None or (mode != m.current and not self.backend.set_mode(m, mode)):
+                self.notify("%s  ·  couldn't switch %s to %s" % (g.name, m.name, describe_mode(width, height, g.mode_hz)), 7000)
+                return
+            if m.id not in self.mode_set:
+                if mode == m.current:
+                    return
+                self.mode_set[m.id] = (m.current, set())
+            self.mode_set[m.id][1].add(key)
+            if mode != m.current:
+                log("Set display mode %s on %s" % (describe_mode(*mode), m.name))
+                self.notify("%s  ·  %s  ·  %s" % (g.name, describe_mode(*mode), m.name))
+
+        def restore_modes(self, key):
+            """Puts back each monitor's mode from before the game once no running game holds it (key None = all)."""
+            restored = []
+            mons = {m.id: m for m in self.backend.monitors()} if self.mode_set else {}
+            for mon_id, (original, holders) in list(self.mode_set.items()):
+                if key is not None:
+                    if key not in holders:
+                        continue
+                    holders.discard(key)
+                    if holders:
+                        continue
+                del self.mode_set[mon_id]
+                m = mons.get(mon_id)
+                if m and original and (m.current == original or self.backend.set_mode(m, original)):
+                    log("Restored display mode on " + m.name)
+                    restored.append(m.name)
+            return restored
+
         def enable_for(self, g, key):
             changed = []
             for m in self.backend.monitors():
@@ -1493,6 +1849,10 @@ def run_ui(args):
             log("Game stopped: " + g.name)
             if key in self.prompts:
                 self.prompts.pop(key).dismiss()
+            mode_restored = bool(self.restore_modes(key))
+            # The game saved its own settings as it exited, so put the chosen resolution back for next time.
+            # cfg.games, because editing a running game replaces its object.
+            GameConfig.apply_resolution(next((x for x in cfg.games if x.exe == g.exe), g))
             mons = {m.id: m for m in self.backend.monitors()}
             changed = []
             for path, holders in list(self.auto_on.items()):
@@ -1505,8 +1865,9 @@ def run_ui(args):
                 m = mons.get(path)
                 if g.restore and m and m.hdr_on and self.backend.set_hdr(m, False):
                     changed.append(m.name)
-            if changed:
-                self.notify("%s closed  ·  HDR OFF  ·  %s" % (g.name, ", ".join(changed)))
+            parts = (["HDR OFF  ·  " + ", ".join(changed)] if changed else []) + (["display mode restored"] if mode_restored else [])
+            if parts:
+                self.notify("%s closed  ·  %s" % (g.name, "  ·  ".join(parts)))
             self.update_indicator()
 
         def check_oled(self):

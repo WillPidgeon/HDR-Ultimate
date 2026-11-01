@@ -8,6 +8,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Text;
@@ -25,7 +26,7 @@ namespace HdrUltimate
     // Each channel has its own name, settings folder and startup entry, so builds never touch each other's data.
     static class Build
     {
-        public const string Version = "1.1.0";
+        public const string Version = "1.2.0";
 #if DEV
         public const string Name = "HDR Ultimate Dev", Channel = "dev", RunName = "HDRUltimateDev", OldRunName = RunName;
         public const bool Dev = true, Release = false, InGameHdrColumn = true;
@@ -173,6 +174,22 @@ namespace HdrUltimate
     [StructLayout(LayoutKind.Sequential)]
     struct SET_STATE { public DEVICE_INFO_HEADER header; public uint value; }
 
+    // DEVMODEW, display fields only (the printer fields share its unions).
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct DEVMODE
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public ushort dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public uint dmFields;
+        public int dmPositionX, dmPositionY;
+        public uint dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public ushort dmLogPixels;
+        public uint dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+        public uint dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+    }
+
     static class Native
     {
         public const uint QDC_ONLY_ACTIVE_PATHS = 2;
@@ -186,6 +203,12 @@ namespace HdrUltimate
         [DllImport("user32.dll")] public static extern int DisplayConfigGetDeviceInfo(ref ADVANCED_COLOR_INFO info);
         [DllImport("user32.dll")] public static extern int DisplayConfigGetDeviceInfo(ref ADVANCED_COLOR_INFO_2 info);
         [DllImport("user32.dll")] public static extern int DisplayConfigSetDeviceInfo(ref SET_STATE info);
+
+        public const int ENUM_CURRENT_SETTINGS = -1;
+        public const uint DM_PELSWIDTH = 0x80000, DM_PELSHEIGHT = 0x100000, DM_DISPLAYFREQUENCY = 0x400000, DM_INTERLACED = 0x2;
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplaySettings(string device, int mode, ref DEVMODE dm);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, ref DEVMODE dm, IntPtr hwnd, uint flags, IntPtr param);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, IntPtr dm, IntPtr hwnd, uint flags, IntPtr param);
 
         [DllImport("user32.dll", SetLastError = true)] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
@@ -330,6 +353,87 @@ namespace HdrUltimate
         }
     }
 
+    // ------------------------------------------------------------------ Display modes
+
+    class DisplayMode
+    {
+        public int Width, Height, Hz;
+        public string SizeText { get { return Width + " × " + Height; } }
+        public static string Describe(int width, int height, int hz)
+        {
+            var parts = new List<string>();
+            if (width > 0) parts.Add(width + " × " + height);
+            if (hz > 0) parts.Add(hz + " Hz");
+            return string.Join(" @ ", parts);
+        }
+    }
+
+    enum ModeResult { Changed, AlreadySet, Failed }
+
+    // Resolution and refresh rate. Changes are temporary: Windows keeps the mode from Display settings,
+    // and Reset goes back to it, so a reboot also undoes anything left behind.
+    static class DisplayModes
+    {
+        static DEVMODE Blank()
+        {
+            var dm = new DEVMODE();
+            dm.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODE));
+            return dm;
+        }
+
+        // Every resolution and refresh rate the monitor offers, largest and fastest first.
+        public static List<DisplayMode> List(string gdiName)
+        {
+            var found = new Dictionary<string, DisplayMode>();
+            var dm = Blank();
+            for (int i = 0; Native.EnumDisplaySettings(gdiName, i, ref dm); i++)
+            {
+                if ((dm.dmDisplayFlags & Native.DM_INTERLACED) != 0 || dm.dmBitsPerPel < 32) continue;
+                var m = new DisplayMode { Width = (int)dm.dmPelsWidth, Height = (int)dm.dmPelsHeight, Hz = (int)dm.dmDisplayFrequency };
+                found[m.Width + "x" + m.Height + "@" + m.Hz] = m;
+            }
+            return found.Values.OrderByDescending(m => m.Width * m.Height).ThenByDescending(m => m.Width).ThenByDescending(m => m.Hz).ToList();
+        }
+
+        public static DisplayMode Current(string gdiName)
+        {
+            var dm = Blank();
+            if (!Native.EnumDisplaySettings(gdiName, Native.ENUM_CURRENT_SETTINGS, ref dm)) return null;
+            return new DisplayMode { Width = (int)dm.dmPelsWidth, Height = (int)dm.dmPelsHeight, Hz = (int)dm.dmDisplayFrequency };
+        }
+
+        // Zero keeps that part as it is. A new resolution keeps the current refresh rate if it has it, otherwise its fastest.
+        public static ModeResult Set(MonitorInfo m, int width, int height, int hz)
+        {
+            var dm = Blank();
+            if (string.IsNullOrEmpty(m.GdiName) || !Native.EnumDisplaySettings(m.GdiName, Native.ENUM_CURRENT_SETTINGS, ref dm)) return ModeResult.Failed;
+            int w = width > 0 ? width : (int)dm.dmPelsWidth, h = width > 0 ? height : (int)dm.dmPelsHeight;
+            var rates = List(m.GdiName).Where(x => x.Width == w && x.Height == h).Select(x => x.Hz).ToList();
+            int rate = hz > 0 ? hz : rates.Contains((int)dm.dmDisplayFrequency) ? (int)dm.dmDisplayFrequency : rates.DefaultIfEmpty(0).Max();
+            string text = DisplayMode.Describe(w, h, rate);
+            if (!rates.Contains(rate))
+            {
+                Log.Write("Display mode " + text + " isn't offered by " + m.Name);
+                return ModeResult.Failed;
+            }
+            if (w == dm.dmPelsWidth && h == dm.dmPelsHeight && rate == dm.dmDisplayFrequency) return ModeResult.AlreadySet;
+
+            dm.dmPelsWidth = (uint)w; dm.dmPelsHeight = (uint)h; dm.dmDisplayFrequency = (uint)rate;
+            dm.dmFields = Native.DM_PELSWIDTH | Native.DM_PELSHEIGHT | Native.DM_DISPLAYFREQUENCY;
+            int err = Native.ChangeDisplaySettingsEx(m.GdiName, ref dm, IntPtr.Zero, 0, IntPtr.Zero);
+            Log.Write("Set display mode " + text + " on " + m.Name + ": " + (err == 0 ? "ok" : "FAILED (" + err + ")"));
+            return err == 0 ? ModeResult.Changed : ModeResult.Failed;
+        }
+
+        // Back to the mode chosen in Windows Display settings.
+        public static bool Reset(MonitorInfo m)
+        {
+            int err = Native.ChangeDisplaySettingsEx(m.GdiName, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+            Log.Write("Restored display mode on " + m.Name + ": " + (err == 0 ? "ok" : "FAILED (" + err + ")"));
+            return err == 0;
+        }
+    }
+
     // ------------------------------------------------------------------ Config
 
     class Binding
@@ -349,6 +453,14 @@ namespace HdrUltimate
         public bool SkipIfOff;          // don't offer HDR when the game's own HDR option is off
         public bool OledCare = true;    // turn HDR off while tabbed out of the game
         public Dictionary<string, string> Monitors = new Dictionary<string, string>();
+        // Display mode while the game runs, on one monitor. Blank monitor = leave it; zero = keep that part.
+        public string ModeMonitor = "";
+        public int ModeWidth, ModeHeight, ModeHz;
+        public bool ModeInGame;         // resolution goes in the game's settings file instead of Windows
+
+        public bool HasMode { get { return ModeMonitor != "" && (ModeWidth > 0 || ModeHz > 0); } }
+        public int DesktopWidth { get { return ModeInGame ? 0 : ModeWidth; } }
+        public int DesktopHeight { get { return ModeInGame ? 0 : ModeHeight; } }
 
         public static string NameFor(string exe)
         {
@@ -372,6 +484,8 @@ namespace HdrUltimate
         public const int OledMinMinutes = 1, OledMaxMinutes = 30;
         public int OledMinutes = 5;     // minutes tabbed out before OLED care turns HDR off
         public bool OledEnabled;        // master switch, offered on first run; each game can still opt out
+        public bool UsageEnabled = true, UsageAsked; // daily check-in for the active user count; opt-out offered on first run
+        public string UsageDay = "";    // UTC date of the last check-in
 
         static string AppData { get { return Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); } }
         public static string Dir { get { return Path.Combine(AppData, Build.Name); } }
@@ -406,6 +520,9 @@ namespace HdrUltimate
                     else if (p[0] == "oled_default" && p.Length > 1) c.OledDefaultApplied = p[1] == "1";
                     else if (p[0] == "oled_asked" && p.Length > 1) c.OledAsked = p[1] == "1";
                     else if (p[0] == "oled_enabled" && p.Length > 1) c.OledEnabled = p[1] == "1";
+                    else if (p[0] == "usage_enabled" && p.Length > 1) c.UsageEnabled = p[1] == "1";
+                    else if (p[0] == "usage_asked" && p.Length > 1) c.UsageAsked = p[1] == "1";
+                    else if (p[0] == "usage_day" && p.Length > 1) c.UsageDay = p[1];
                     else if (p[0] == "oled_minutes" && p.Length > 1)
                         c.OledMinutes = Math.Max(OledMinMinutes, Math.Min(OledMaxMinutes, int.Parse(p[1])));
                     else if (p[0] == "bind" && p.Length > 3)
@@ -420,7 +537,18 @@ namespace HdrUltimate
                         ReadMonitors(p, 4, g.Monitors);
                         c.Games.Add(g);
                     }
-                    else if (p[0] == "game3" && p.Length > 8)
+                    else if (p[0] == "game4" && p.Length > 13)
+                    {
+                        var g = new Game
+                        {
+                            Restore = p[1] == "1", Ask = p[2] == "1", SkipIfOff = p[3] == "1", OledCare = p[4] == "1",
+                            ModeMonitor = p[5], ModeWidth = int.Parse(p[6]), ModeHeight = int.Parse(p[7]), ModeHz = int.Parse(p[8]),
+                            ModeInGame = p[9] == "1", ConfigPath = p[10], ExePath = p[11], Name = p[12]
+                        };
+                        ReadMonitors(p, 13, g.Monitors);
+                        c.Games.Add(g);
+                    }
+                    else if (p[0] == "game3" && p.Length > 8) // pre-display mode format
                     {
                         var g = new Game
                         {
@@ -486,6 +614,9 @@ namespace HdrUltimate
             sb.AppendLine("oled_default\t" + (OledDefaultApplied ? "1" : "0"));
             sb.AppendLine("oled_asked\t" + (OledAsked ? "1" : "0"));
             sb.AppendLine("oled_enabled\t" + (OledEnabled ? "1" : "0"));
+            sb.AppendLine("usage_enabled\t" + (UsageEnabled ? "1" : "0"));
+            sb.AppendLine("usage_asked\t" + (UsageAsked ? "1" : "0"));
+            sb.AppendLine("usage_day\t" + UsageDay);
             sb.AppendLine("oled_minutes\t" + OledMinutes);
             foreach (var b in Bindings)
             {
@@ -494,8 +625,9 @@ namespace HdrUltimate
             }
             foreach (var g in Games)
             {
-                sb.Append("game3\t" + (g.Restore ? "1" : "0") + "\t" + (g.Ask ? "1" : "0") + "\t" + (g.SkipIfOff ? "1" : "0") +
-                          "\t" + (g.OledCare ? "1" : "0") + "\t" + (g.ConfigPath ?? "") + "\t" + g.ExePath + "\t" + g.Name.Replace("\t", " "));
+                sb.Append("game4\t" + (g.Restore ? "1" : "0") + "\t" + (g.Ask ? "1" : "0") + "\t" + (g.SkipIfOff ? "1" : "0") +
+                          "\t" + (g.OledCare ? "1" : "0") + "\t" + g.ModeMonitor + "\t" + g.ModeWidth + "\t" + g.ModeHeight + "\t" + g.ModeHz +
+                          "\t" + (g.ModeInGame ? "1" : "0") + "\t" + (g.ConfigPath ?? "") + "\t" + g.ExePath + "\t" + g.Name.Replace("\t", " "));
                 WriteMonitors(sb, g.Monitors);
             }
             Directory.CreateDirectory(Dir);
@@ -504,6 +636,64 @@ namespace HdrUltimate
     }
 
     // ------------------------------------------------------------------ Hotkeys
+
+    // Active user count: one empty check-in per day, with nothing that identifies the user or PC.
+    // The server (website/functions/ping.js) only adds one to that day's total.
+    static class Usage
+    {
+        // Blank = no check-ins, and nothing is offered.
+        const string Endpoint = "https://hdrultra.help/ping";
+        // Test builds only check in to a test server named in this variable.
+        const string TestVariable = "HDRULTIMATE_USAGE_TEST_URL";
+
+        public static bool Offered { get { return Build.Release && Endpoint != ""; } }
+        static string Url { get { return Build.Release ? Endpoint : Environment.GetEnvironmentVariable(TestVariable) ?? ""; } }
+
+        static DateTime nextTry = DateTime.MinValue;
+        static bool sending;
+
+        // From the poll timer: at most one check-in per UTC day, retrying every 30 minutes while offline.
+        public static void Tick(Config cfg)
+        {
+            string today = DateTime.UtcNow.ToString("yyyy-MM-dd");
+            if (Url == "" || !cfg.UsageEnabled || !cfg.UsageAsked || cfg.UsageDay == today || sending || DateTime.UtcNow < nextTry) return;
+            sending = true;
+            nextTry = DateTime.UtcNow.AddMinutes(30);
+            string url = Url;
+            var ui = SynchronizationContext.Current;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                bool ok = Send(url);
+                ui.Post(__ =>
+                {
+                    sending = false;
+                    if (!ok) return;
+                    cfg.UsageDay = today;
+                    cfg.Save();
+                }, null);
+            });
+        }
+
+        static bool Send(string url)
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2, which .NET 4.0 doesn't name
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "POST";
+                req.UserAgent = "HDRUltimate";
+                req.ContentLength = 0;
+                req.Timeout = 15000;
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                {
+                    Log.Write("Usage check-in: " + (int)resp.StatusCode);
+                    // Only the counter answers 204; a parking page or Wi-Fi sign-in page answering 200 doesn't count.
+                    return resp.StatusCode == HttpStatusCode.NoContent;
+                }
+            }
+            catch (Exception ex) { Log.Write("Usage check-in failed: " + ex.Message); return false; }
+        }
+    }
 
     static class Hotkeys
     {
@@ -666,6 +856,86 @@ namespace HdrUltimate
             return text == null ? null : Parse(text);
         }
 
+        // ---- In-game resolution
+
+        // "2560x1440" under a resolution setting: Cyberpunk's { "name": "Resolution", ..., "value": "2560x1440" }, or key = 2560x1440.
+        static readonly Regex[] PairPatterns =
+        {
+            new Regex("(\"name\"\\s*:\\s*\"[^\"]*resolution[^\"]*\"[^{}]*?\"value\"\\s*:\\s*\")(\\d{3,5})(\\s*[xX]\\s*)(\\d{3,5})", RegexOptions.IgnoreCase),
+            new Regex("^([ \\t]*\"?[\\w.]*resolution[\\w.]*\"?[ \\t]*[:=][ \\t]*\"?)(\\d{3,5})(\\s*[xX]\\s*)(\\d{3,5})", RegexOptions.IgnoreCase | RegexOptions.Multiline),
+        };
+        // Separate width and height settings, group 2 = name, group 3 = number: RDR2's <screenWidth value="2560" />,
+        // Unreal's ResolutionSizeX=2560, and "name"/"value" JSON.
+        static readonly Regex[] NumberPatterns =
+        {
+            new Regex("(<([\\w.]+)\\b[^>]*?value\\s*=\\s*\")(\\d{3,5})(?=\")", RegexOptions.IgnoreCase),
+            new Regex("^([ \\t]*\"?([\\w.]+)\"?[ \\t]*[:=][ \\t]*\"?)(\\d{3,5})(?![\\d.xX])", RegexOptions.IgnoreCase | RegexOptions.Multiline),
+            new Regex("(\"name\"\\s*:\\s*\"([^\"]+)\"[^{}]*?\"value\"\\s*:\\s*)(\\d{3,5})(?![\\d.])", RegexOptions.IgnoreCase),
+        };
+
+        // 'w' or 'h' for a screen width/height setting, else null. Window positions, limits and render sizes don't count.
+        static char? Dimension(string key)
+        {
+            key = key.ToLowerInvariant();
+            if (!Regex.IsMatch(key, "screen|resolution|desired|display|fullscreen") ||
+                Regex.IsMatch(key, "pos|min|max|hud|border|texture|shadow|render|scale|percent|index|offset|ratio|aspect|safe|fov")) return null;
+            if (Regex.IsMatch(key, "width|sizex$|resx$|resolutionx$")) return 'w';
+            if (Regex.IsMatch(key, "height|sizey$|resy$|resolutiony$")) return 'h';
+            return null;
+        }
+
+        // Rewrites every resolution setting in the text. Returns how many it changed (unchanged ones included), 0 = none found.
+        static int ReplaceResolution(ref string text, int width, int height)
+        {
+            int found = 0;
+            foreach (var re in PairPatterns)
+                text = re.Replace(text, m => { found++; return m.Groups[1].Value + width + m.Groups[3].Value + height; });
+            foreach (var re in NumberPatterns)
+                text = re.Replace(text, m =>
+                {
+                    char? d = Dimension(m.Groups[2].Value);
+                    if (d == null || int.Parse(m.Groups[3].Value) < 320) return m.Value;
+                    found++;
+                    return m.Groups[1].Value + (d == 'w' ? width : height);
+                });
+            return found;
+        }
+
+        // Writes a game's chosen in-game resolution, if it has one. False when there's nothing to write or it failed.
+        public static bool ApplyResolution(Game g)
+        {
+            if (!g.ModeInGame || g.ModeWidth <= 0 || string.IsNullOrEmpty(g.ConfigPath) || !File.Exists(g.ConfigPath)) return false;
+            return SetResolution(g.ConfigPath, g.ModeWidth, g.ModeHeight);
+        }
+
+        public static bool HasResolution(string file)
+        {
+            string text = File.Exists(file) ? Read(file) : null;
+            return text != null && ReplaceResolution(ref text, 1, 1) > 0;
+        }
+
+        // Writes the resolution into the game's settings file, keeping its encoding. The first write keeps a backup
+        // next to it. Only call this while the game is closed: games rewrite their settings when they exit.
+        public static bool SetResolution(string file, int width, int height)
+        {
+            try
+            {
+                byte[] bytes = File.ReadAllBytes(file);
+                Encoding enc = bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE ? Encoding.Unicode
+                    : bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF ? new UTF8Encoding(true)
+                    : (Encoding)new UTF8Encoding(false);
+                string before = enc.GetString(bytes, enc.GetPreamble().Length, bytes.Length - enc.GetPreamble().Length), after = before;
+                if (ReplaceResolution(ref after, width, height) == 0) { Log.Write("No resolution setting in " + file); return false; }
+                if (after == before) return true;
+                string backup = file + ".hdrultimate.bak";
+                if (!File.Exists(backup)) File.Copy(file, backup);
+                File.WriteAllText(file, after, enc);
+                Log.Write("Set in-game resolution " + width + "x" + height + " in " + file);
+                return true;
+            }
+            catch (Exception ex) { Log.Write("Couldn't set in-game resolution in " + file + ": " + ex.Message); return false; }
+        }
+
         static List<string> Candidates(Game g)
         {
             var list = new List<string>();
@@ -825,6 +1095,8 @@ namespace HdrUltimate
         // OLED care: when each watched monitor's game last had focus, and the monitors it has turned off.
         readonly Dictionary<string, DateTime> lastFocused = new Dictionary<string, DateTime>();
         readonly HashSet<string> oledOff = new HashSet<string>();
+        // Monitors whose display mode we changed (monitor path -> exe paths holding it).
+        readonly Dictionary<string, HashSet<string>> modeSet = new Dictionary<string, HashSet<string>>();
 
         public TrayApp()
         {
@@ -851,7 +1123,7 @@ namespace HdrUltimate
             // HDR can also be changed from Windows Settings or Win+Alt+B, so keep the indicator in sync.
             CheckGames();
             UpdateIndicator();
-            poll.Tick += (s, e) => { CheckGames(); CheckOledCare(); UpdateIndicator(); };
+            poll.Tick += (s, e) => { CheckGames(); CheckOledCare(); UpdateIndicator(); Usage.Tick(cfg); };
             poll.Start();
 
             if (!cfg.StartupAsked && !Build.Dev)
@@ -871,6 +1143,18 @@ namespace HdrUltimate
                     "Turn on OLED care"))
                     cfg.OledEnabled = prompt.ShowDialog() == DialogResult.Yes;
                 cfg.OledAsked = true;
+                cfg.Save();
+            }
+
+            // On by default; this is the chance to opt out. No check-in goes out until it's answered.
+            if (!cfg.UsageAsked && Usage.Offered)
+            {
+                using (var prompt = new StartupPrompt("Anonymous active user count",
+                    "HDR Ultimate checks in once a day, only to count how many people are using it. Nothing about you, " +
+                    "your PC, your games or your settings is sent. You can turn this off any time under Settings.",
+                    "Keep it on", "Opt out"))
+                    cfg.UsageEnabled = prompt.ShowDialog() != DialogResult.No;
+                cfg.UsageAsked = true;
                 cfg.Save();
             }
 
@@ -927,6 +1211,7 @@ namespace HdrUltimate
         void GameStarted(Game g)
         {
             Log.Write("Game started: " + g.Name + " (" + g.ExePath + ")");
+            ApplyMode(g);
             // Monitors already switched on for another running game just pick up this game as a holder too.
             foreach (var path in g.Monitors.Keys)
             {
@@ -955,6 +1240,46 @@ namespace HdrUltimate
             };
             prompts[g.ExePath] = prompt;
             prompt.Show();
+        }
+
+        // Switches the game's monitor to its resolution and refresh rate. A monitor already in that mode
+        // is left alone afterwards too, the same as HDR.
+        void ApplyMode(Game g)
+        {
+            if (!g.HasMode || (g.DesktopWidth == 0 && g.ModeHz == 0)) return; // in-game resolution only: written when the game closes
+            var m = Hdr.GetMonitors().FirstOrDefault(x => x.DevicePath == g.ModeMonitor);
+            if (m == null) { Log.Write("Display mode for " + g.Name + ": monitor not connected"); return; }
+            var result = DisplayModes.Set(m, g.DesktopWidth, g.DesktopHeight, g.ModeHz);
+            if (result == ModeResult.Failed)
+            {
+                Notify(g.Name + "  ·  couldn't switch " + m.Name + " to " + DisplayMode.Describe(g.DesktopWidth, g.DesktopHeight, g.ModeHz), 7000);
+                return;
+            }
+            HashSet<string> holders;
+            if (!modeSet.TryGetValue(m.DevicePath, out holders))
+            {
+                if (result == ModeResult.AlreadySet) return;
+                modeSet[m.DevicePath] = holders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            }
+            holders.Add(g.ExePath);
+            var now = DisplayModes.Current(m.GdiName);
+            if (result == ModeResult.Changed && now != null)
+                Notify(g.Name + "  ·  " + DisplayMode.Describe(now.Width, now.Height, now.Hz) + "  ·  " + m.Name);
+        }
+
+        // Puts back the Windows display mode once no running game holds the monitor. Returns the monitors restored.
+        List<string> RestoreModes(string exePath, List<MonitorInfo> mons)
+        {
+            var restored = new List<string>();
+            foreach (var path in modeSet.Keys.ToList())
+            {
+                var holders = modeSet[path];
+                if (exePath != null && (!holders.Remove(exePath) || holders.Count > 0)) continue;
+                modeSet.Remove(path);
+                var m = mons.FirstOrDefault(x => x.DevicePath == path);
+                if (m != null && DisplayModes.Reset(m)) restored.Add(m.Name);
+            }
+            return restored;
         }
 
         void EnableFor(Game g)
@@ -1000,6 +1325,10 @@ namespace HdrUltimate
             GamePrompt prompt;
             if (prompts.TryGetValue(g.ExePath, out prompt)) { prompts.Remove(g.ExePath); prompt.Dismiss(); }
             var mons = Hdr.GetMonitors();
+            bool modeRestored = RestoreModes(g.ExePath, mons).Count > 0;
+            // The game saved its own settings as it exited, so put the chosen resolution back for next time.
+            // cfg.Games, because editing a running game replaces its object.
+            GameConfig.ApplyResolution(cfg.Games.FirstOrDefault(x => string.Equals(x.ExePath, g.ExePath, StringComparison.OrdinalIgnoreCase)) ?? g);
             var changed = new List<string>();
             foreach (var path in autoOn.Keys.ToList())
             {
@@ -1010,7 +1339,10 @@ namespace HdrUltimate
                 var m = mons.FirstOrDefault(x => x.DevicePath == path);
                 if (m != null && m.HdrOn && Hdr.SetHdr(m, false)) changed.Add(m.Name);
             }
-            if (changed.Count > 0) Notify(g.Name + " closed  ·  HDR OFF  ·  " + string.Join(", ", changed));
+            var parts = new List<string>();
+            if (changed.Count > 0) parts.Add("HDR OFF  ·  " + string.Join(", ", changed));
+            if (modeRestored) parts.Add("display mode restored");
+            if (parts.Count > 0) Notify(g.Name + " closed  ·  " + string.Join("  ·  ", parts));
             UpdateIndicator();
         }
 
@@ -1133,6 +1465,7 @@ namespace HdrUltimate
         protected override void ExitThreadCore()
         {
             poll.Dispose();
+            if (modeSet.Count > 0) RestoreModes(null, Hdr.GetMonitors()); // don't leave a game's display mode behind
             tray.Visible = false;
             tray.Dispose();
             hotkeys.Dispose();
@@ -1876,8 +2209,8 @@ namespace HdrUltimate
                    "Hotkeys and game detection only work while HDR Ultimate is running in the tray. You can change this any time under Settings.",
                    "Yes, start with Windows") { }
 
-        // A first-run yes/no question; Yes returns DialogResult.Yes.
-        public StartupPrompt(string question, string detail, string yesText)
+        // A first-run yes/no question; Yes returns DialogResult.Yes, the other button DialogResult.No.
+        public StartupPrompt(string question, string detail, string yesText, string noText = "Not now")
         {
             Text = Build.Name;
             Icon = AppIcon.Get();
@@ -1898,7 +2231,7 @@ namespace HdrUltimate
             ClientSize = new Size(460, body.Bottom + 62);
             var row = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 52, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(10) };
             var yes = new Button { Text = yesText, AutoSize = true, Tag = "primary", DialogResult = DialogResult.Yes };
-            var no = new Button { Text = "Not now", AutoSize = true, DialogResult = DialogResult.No };
+            var no = new Button { Text = noText, AutoSize = true, DialogResult = DialogResult.No };
             row.Controls.AddRange(new Control[] { yes, no });
             Controls.AddRange(new Control[] { title, body, row });
             AcceptButton = yes;
@@ -2289,6 +2622,8 @@ namespace HdrUltimate
                 Line("On-screen notice", Switch(cfg.ShowOsd, v => { cfg.ShowOsd = v; cfg.Save(); })),
                 Line("Auto HDR for games", Switch(cfg.GamesEnabled, v => { cfg.GamesEnabled = v; cfg.Save(); }))
             };
+            if (Usage.Offered)
+                rows.Add(Line("Anonymous active user count", Switch(cfg.UsageEnabled, v => { cfg.UsageEnabled = v; cfg.Save(); })));
             if (!Build.Release)
             {
                 var logs = Btn("Open folder", () => Process.Start("explorer.exe", "\"" + Config.Dir + "\""));
@@ -2478,6 +2813,8 @@ namespace HdrUltimate
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
                 if (index < 0) cfg.Games.Add(dlg.Result);
                 else cfg.Games[index] = dlg.Result;
+                // A running game would overwrite it on exit; it's written when the game closes instead.
+                if (GameWatcher.Running(new List<Game> { dlg.Result }).Count == 0) GameConfig.ApplyResolution(dlg.Result);
             }
             failed = apply();
             Refill();
@@ -2700,8 +3037,15 @@ namespace HdrUltimate
         public Game Result;
         readonly TextBox name;
         readonly MonitorDropdown monitors;
-        readonly SelectDropdown exeChoice, cfgChoice, onStart, ifOff, onClose, oledCare;
+        readonly SelectDropdown exeChoice, cfgChoice, onStart, ifOff, onClose, oledCare, modeMonitor, resolution, applyTo, refresh;
         string exePath, cfgPath;
+        // Display mode pickers: the monitors, then what the chosen one offers.
+        readonly List<MonitorInfo> connected = Hdr.GetMonitors();
+        readonly List<string> modePaths = new List<string>();
+        List<DisplayMode> modes = new List<DisplayMode>();
+        List<DisplayMode> sizes = new List<DisplayMode>();
+        List<int> rates = new List<int>();
+        DisplayMode current;
 
         // Label on the left, control on the right.
         void Row(string label, int y, Control box)
@@ -2754,6 +3098,14 @@ namespace HdrUltimate
             ifOff = Choice(g.SkipIfOff ? 0 : 1, "Leave Windows HDR off", "Offer HDR anyway");
             onClose = Choice(g.Restore ? 0 : 1, "Turn HDR back off", "Leave HDR on");
             oledCare = Choice(g.OledCare ? 1 : 0, "Keep HDR on", "Turn HDR off (OLED care)");
+            modeMonitor = new SelectDropdown();
+            resolution = new SelectDropdown();
+            applyTo = Choice(g.ModeInGame ? 1 : 0, "Desktop", "In-game");
+            refresh = new SelectDropdown();
+            FillModeMonitors(g);
+            FillSizes(g.ModeWidth, g.ModeHeight, g.ModeHz);
+            modeMonitor.Changed += () => FillSizes(SelectedSize().Width, SelectedSize().Height, SelectedHz());
+            resolution.Changed += () => FillRates(SelectedHz());
 
             int y = 18;
             Action<string, Control> next = (label, box) => { Row(label, y, box); y += 40; };
@@ -2765,6 +3117,10 @@ namespace HdrUltimate
             next("If HDR is off in the game", ifOff);
             next("When the game closes", onClose);
             next("When tabbed out", oledCare);
+            next("Display mode on", modeMonitor);
+            next("Resolution", resolution);
+            next("Resolution applies to", applyTo);
+            next("Refresh rate", refresh);
             ClientSize = new Size(480, y + 84);
 
             var ok = new Button { Text = "Save", Location = new Point(296, y + 32), Width = 80, Tag = "primary" };
@@ -2778,6 +3134,53 @@ namespace HdrUltimate
             if (string.IsNullOrEmpty(g.ConfigPath) || !File.Exists(g.ConfigPath)) Detect();
             else ShowStatus();
         }
+
+        // The saved monitor, else the first of the game's HDR monitors, else the main display.
+        void FillModeMonitors(Game g)
+        {
+            var labels = new List<string>();
+            foreach (var m in connected) { modePaths.Add(m.DevicePath); labels.Add(m.Label); }
+            if (g.ModeMonitor != "" && !modePaths.Contains(g.ModeMonitor))
+            {
+                string saved;
+                modePaths.Add(g.ModeMonitor);
+                labels.Add((g.Monitors.TryGetValue(g.ModeMonitor, out saved) ? saved : "Saved monitor") + "  — not connected");
+            }
+            int pick = modePaths.IndexOf(g.ModeMonitor);
+            if (pick < 0) pick = modePaths.FindIndex(g.Monitors.ContainsKey);
+            if (pick < 0) pick = connected.FindIndex(m => m.GdiName == Screen.PrimaryScreen.DeviceName);
+            modeMonitor.Options = labels.Count > 0 ? labels.ToArray() : new[] { "No monitors found" };
+            modeMonitor.Selected = Math.Max(0, pick);
+        }
+
+        // Keeps the given choices where the monitor offers them. A disconnected monitor just shows what was saved.
+        void FillSizes(int width, int height, int hz)
+        {
+            var m = modeMonitor.Selected < modePaths.Count ? connected.FirstOrDefault(x => x.DevicePath == modePaths[modeMonitor.Selected]) : null;
+            modes = m != null ? DisplayModes.List(m.GdiName) : new List<DisplayMode>();
+            current = m != null ? DisplayModes.Current(m.GdiName) : null;
+            if (m == null && (width > 0 || hz > 0)) modes.Add(new DisplayMode { Width = width, Height = height, Hz = hz });
+            sizes = modes.Where(x => x.Width > 0).GroupBy(x => x.SizeText).Select(x => x.First()).ToList();
+            resolution.Options = new[] { "Don't change" }.Concat(sizes.Select(s =>
+                s.SizeText + (current != null && s.Width == current.Width && s.Height == current.Height ? "  (current)" : ""))).ToArray();
+            resolution.Selected = sizes.FindIndex(s => s.Width == width && s.Height == height) + 1;
+            FillRates(hz);
+        }
+
+        // The rates for the chosen resolution, or for the current one when it isn't changing.
+        void FillRates(int hz)
+        {
+            var size = resolution.Selected > 0 ? sizes[resolution.Selected - 1] : current;
+            rates = modes.Where(x => x.Hz > 0 && (size == null || size.Width == 0 || (x.Width == size.Width && x.Height == size.Height)))
+                         .Select(x => x.Hz).Distinct().OrderByDescending(x => x).ToList();
+            bool sameSize = current != null && size != null && size.Width == current.Width && size.Height == current.Height;
+            refresh.Options = new[] { "Don't change" }.Concat(rates.Select(r =>
+                r + " Hz" + (sameSize && r == current.Hz ? "  (current)" : ""))).ToArray();
+            refresh.Selected = rates.IndexOf(hz) + 1;
+        }
+
+        DisplayMode SelectedSize() { return resolution.Selected > 0 ? sizes[resolution.Selected - 1] : new DisplayMode(); }
+        int SelectedHz() { return refresh.Selected > 0 ? rates[refresh.Selected - 1] : 0; }
 
         void Detect()
         {
@@ -2812,12 +3215,20 @@ namespace HdrUltimate
             string state = on == true ? "  ·  HDR on" : on == false ? "  ·  HDR off" : "";
             cfgChoice.Options = new[] { none ? "None found" : Path.GetFileName(cfgPath) + state, "Detect again", "Choose a file…" };
             cfgChoice.Selected = 0;
+            if (applyTo != null)
+                applyTo.Options = new[] { "Desktop", none || !GameConfig.HasResolution(cfgPath) ? "In-game (not in settings file)" : "In-game" };
         }
 
         void Accept()
         {
             if (string.IsNullOrEmpty(exePath)) { MessageBox.Show(this, "Pick the game's .exe first.", Text); return; }
             if (monitors.Checked.Count == 0) { MessageBox.Show(this, "Pick at least one monitor.", Text); return; }
+            if (applyTo.Selected == 1 && resolution.Selected > 0 && (string.IsNullOrEmpty(cfgPath) || !GameConfig.HasResolution(cfgPath)))
+            {
+                MessageBox.Show(this, "The game's settings file has no resolution setting HDR Ultimate can change. " +
+                    "Choose Desktop, or pick the right file under Game settings file.", Text);
+                return;
+            }
             Result = new Game
             {
                 ExePath = exePath,
@@ -2826,8 +3237,13 @@ namespace HdrUltimate
                 Restore = onClose.Selected == 0,
                 Ask = onStart.Selected == 0,
                 SkipIfOff = ifOff.Selected == 0,
-                OledCare = oledCare.Selected == 1
+                OledCare = oledCare.Selected == 1,
+                ModeWidth = SelectedSize().Width,
+                ModeHeight = SelectedSize().Height,
+                ModeHz = SelectedHz(),
+                ModeInGame = applyTo.Selected == 1
             };
+            if (Result.ModeWidth > 0 || Result.ModeHz > 0) Result.ModeMonitor = modePaths[modeMonitor.Selected];
             MonitorEntry.Collect(monitors.Checked, Result.Monitors);
             DialogResult = DialogResult.OK;
         }

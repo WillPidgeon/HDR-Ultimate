@@ -3,6 +3,10 @@
 *.pdb
 builds/
 
+# Cloudflare Worker tooling
+node_modules/
+.wrangler/
+
 # Python
 __pycache__/
 *.pyc

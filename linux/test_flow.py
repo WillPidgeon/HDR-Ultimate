@@ -13,7 +13,13 @@ h.Build.channel, h.Build.fake = "dev", True
 h.Build.dir().mkdir(parents=True, exist_ok=True)
 (h.Build.dir() / "config.json").write_text(json.dumps({"startup_asked": True, "oled_asked": True, "oled_enabled": True, "games": [
     {"exe": "/g/auto/Auto.exe", "name": "Auto Game", "ask": False, "oled_care": True, "monitors": {"DP-1": "Test OLED"}},
-    {"exe": "/g/ask/Ask.exe", "name": "Ask Game", "monitors": {"DP-2": "Test LCD"}}]}))
+    {"exe": "/g/ask/Ask.exe", "name": "Ask Game", "monitors": {"DP-2": "Test LCD"}},
+    {"exe": "/g/mode/Mode.exe", "name": "Mode Game", "ask": False, "monitors": {"HDMI-A-1": "Old TV"},
+     "mode_monitor": "DP-2", "mode_width": 1920, "mode_height": 1080},
+    {"exe": "/g/ingame/InGame.exe", "name": "In-game Res", "ask": False, "monitors": {"HDMI-A-1": "Old TV"},
+     "config": str(h.Build.dir() / "GameUserSettings.ini"), "mode_monitor": "DP-1",
+     "mode_width": 1920, "mode_height": 1080, "mode_hz": 60, "mode_in_game": True}]}))
+(h.Build.dir() / "GameUserSettings.ini").write_bytes(b"[/Script/Engine.GameUserSettings]\r\nResolutionSizeX=2560\r\nResolutionSizeY=1440\r\nWindowPosX=-1\r\n")
 failures = []
 running = set()
 h.running_exes = lambda games: set(running)
@@ -96,6 +102,24 @@ def drive(app, a, folder, theme, QTimer):
     check("HDR off when games close", not hdr("DP-1") and not hdr("DP-2"))
     pump(0.1)
 
+    # Display modes.
+    def mode(mon):
+        return next(m.current for m in a.backend.monitors() if m.id == mon)
+
+    ini = h.Build.dir() / "GameUserSettings.ini"
+    running.update({"mode.exe", "ingame.exe"})
+    a.tick()
+    check("desktop resolution switches, keeping the refresh rate", mode("DP-2") == (1920, 1080, 144))
+    check("in-game resolution leaves the desktop size, sets refresh", mode("DP-1") == (2560, 1440, 60))
+    check("in-game resolution waits for the game to close", "ResolutionSizeX=2560" in ini.read_text())
+    running.clear()
+    a.tick()
+    check("display modes restored when games close", mode("DP-2") == mode("DP-1") == (2560, 1440, 144))
+    text = ini.read_bytes().decode()
+    check("in-game resolution written after close", "ResolutionSizeX=1920\r\nResolutionSizeY=1080\r\nWindowPosX=-1" in text)
+    check("settings file backed up once", (h.Build.dir() / "GameUserSettings.ini.hdrultimate.bak").exists())
+    pump(4)
+
     # Settings: every cell dropdown, and edit dialog.
     a.open_settings()
     s = a.settings
@@ -122,6 +146,13 @@ def drive(app, a, folder, theme, QTimer):
     QTimer.singleShot(50, lambda: app.activeModalWidget().accept_game())
     s.edit_game(0)
     check("edit dialog saves", json.loads(cfg_file.read_text())["games"][0]["oled_care"] is True)
+    for index in (2, 3):
+        before = json.loads(cfg_file.read_text())["games"][index]
+        QTimer.singleShot(50, lambda: app.activeModalWidget().accept_game())
+        s.edit_game(index)
+        after = json.loads(cfg_file.read_text())["games"][index]
+        keys = ("mode_monitor", "mode_width", "mode_height", "mode_hz", "mode_in_game")
+        check("edit dialog keeps display mode (%s)" % before["name"], all(before[k] == after[k] for k in keys))
     theme.set("light")
     theme.set("dark")
     a.menu.aboutToShow.emit()

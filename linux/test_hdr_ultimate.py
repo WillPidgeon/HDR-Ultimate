@@ -55,6 +55,42 @@ class Parsing(unittest.TestCase):
             (5120, 0, 1.0, 1, False, [("HDMI-1", "c60", {})]),
         ])
 
+    def test_kde_modes(self):
+        text = KDE_TEXT.replace("\tenabled\n", "\tenabled\n\x1b[01;33m\tModes: \x1b[0;0m 1:2560x1440@144*!  2:2560x1440@59.95  3:1920x1080@60  \n", 1)
+        m = KdeBackend.parse(text)[0]
+        self.assertEqual(m.current, (2560, 1440, 144))
+        self.assertEqual(m.modes, [(2560, 1440, 144), (2560, 1440, 60), (1920, 1080, 60)])
+        self.assertEqual(m.mode_ids[(2560, 1440, 60)], "2")
+
+    def test_pick_mode(self):
+        m = Monitor("DP-1", "X", modes=[(2560, 1440, 144), (2560, 1440, 60), (1920, 1080, 60)], current=(2560, 1440, 144))
+        self.assertEqual(h.pick_mode(m, 1920, 1080, 0), (1920, 1080, 60))   # 144 not offered there: fastest it has
+        self.assertEqual(h.pick_mode(m, 0, 0, 60), (2560, 1440, 60))        # refresh only
+        self.assertIsNone(h.pick_mode(m, 1920, 1080, 144))
+
+    def test_gnome_mode_change_moves_neighbours(self):
+        first = h.gnome_monitors(GNOME_STATE)[0]  # two 144 Hz modes: the current one's id wins
+        self.assertEqual((first.modes, first.current, first.mode_ids), ([(2560, 1440, 144)], (2560, 1440, 144), {(2560, 1440, 144): "a144"}))
+        state = (GNOME_STATE[0], [(GNOME_STATE[1][0][0], GNOME_STATE[1][0][1] + [("a1080", 1920, 1080, 60.0, 1.0, [1.0], {})],
+                                   GNOME_STATE[1][0][2])] + GNOME_STATE[1][1:], GNOME_STATE[2], GNOME_STATE[3])
+        _, _, logical, _ = h.gnome_config(state, "DP-1", None, lambda v: v, "a1080")
+        self.assertEqual([(lm[0], lm[5][0][1]) for lm in logical], [(0, "a1080"), (1920, "b144"), (4480, "c60")])
+        self.assertEqual(logical[0][5][0][2], {"color-mode": 0})  # colour mode untouched
+
+    def test_in_game_resolution(self):
+        cases = [
+            ('{ "name": "Resolution", "type": "string_list", "value": "2560x1440", "index": 20 }', '"value": "1920x1080"'),
+            ('<screenWidth value="2560" />\n<screenHeight value="1440" />\n<resolutionIndexWindowed value="20" />',
+             '<screenWidth value="1920" />\n<screenHeight value="1080" />\n<resolutionIndexWindowed value="20" />'),
+            ("ResolutionSizeX=2560\nResolutionSizeY=1440\nWindowPosX=-1\nFrameRateLimit=240.000000",
+             "ResolutionSizeX=1920\nResolutionSizeY=1080\nWindowPosX=-1\nFrameRateLimit=240.000000"),
+        ]
+        for text, expected in cases:
+            out, found = GameConfig.replace_resolution(text, 1920, 1080)
+            self.assertIn(expected, out)
+            self.assertGreater(found, 0)
+        self.assertEqual(GameConfig.replace_resolution("MaxFPS=240\nTextureWidth=2048", 1920, 1080)[1], 0)
+
     def test_paths(self):
         self.assertEqual(h.file_name(r"Z:\games\Foo.exe"), "Foo.exe")
         self.assertEqual(h.file_name("/games/foo/Foo.exe"), "Foo.exe")
@@ -113,6 +149,54 @@ class Oled(unittest.TestCase):
         self.tick(61, self.on, False)
         self.assertEqual(self.tick(63, self.off, False, running=False), ([], []))
         self.assertEqual(self.care.off, set())
+
+
+class UsageCheckIn(unittest.TestCase):
+    def test_once_a_day_nothing_else_and_opt_out(self):
+        import os
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, dict(self.headers), self.rfile.read(int(self.headers["Content-Length"] or 0))))
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        os.environ[h.Usage.TEST_VARIABLE] = "http://127.0.0.1:%d/ping" % server.server_port
+        channel, h.Build.channel = h.Build.channel, "dev"
+        try:
+            def run(config):
+                usage = h.Usage()
+                config.save = lambda: None
+                usage.tick(config)
+                while usage.sending:
+                    time.sleep(0.01)
+                usage.tick(config)  # picks up the finished check-in
+                usage.next_try = 0
+                usage.tick(config)  # same day: nothing more
+                time.sleep(0.2)
+                return config
+
+            config = run(h.Config(usage_asked=True))
+            self.assertEqual(len(seen), 1)
+            path, headers, body = seen[0]
+            self.assertEqual((path, headers["User-Agent"], body), ("/ping", "HDRUltimate", b""))
+            self.assertTrue(config.usage_day)
+            run(h.Config(usage_asked=True, usage_enabled=False))
+            run(h.Config(usage_asked=False))
+            self.assertEqual(len(seen), 1)
+        finally:
+            h.Build.channel = channel
+            server.shutdown()
 
 
 if __name__ == "__main__":

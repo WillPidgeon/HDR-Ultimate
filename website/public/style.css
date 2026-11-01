@@ -1,0 +1,287 @@
+@font-face {
+  font-family: "Orbitron";
+  src: url("fonts/Orbitron.ttf") format("truetype");
+  font-weight: 400 900;
+  font-display: swap;
+}
+
+/* The app's own palettes: red accent in light mode, purple in dark. */
+:root {
+  --bg: #ffffff;
+  --surface: #f6f6f8;
+  --border: #dedee4;
+  --text: #18181b;
+  --muted: #6c6c74;
+  --accent: #dc2634;
+  --accent-hover: #b91c28;
+  --on-accent: #ffffff;
+  --rainbow: linear-gradient(90deg, #ff3b30, #ff9500, #ffcc00, #34c759, #007aff, #5856d6, #af52de);
+  --radius: 10px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --surface: #141418;
+    --border: #32323a;
+    --text: #f0f0f5;
+    --muted: #9696a0;
+    --accent: #9358ff;
+    --accent-hover: #7c3aed;
+    color-scheme: dark;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 17px/1.6 "Segoe UI", system-ui, -apple-system, "Noto Sans", Ubuntu, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: inherit; }
+
+h1, h2, h3, .brand span {
+  font-family: "Orbitron", "Segoe UI", system-ui, sans-serif;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0.01em;
+}
+
+h2 { font-size: clamp(1.5rem, 3.5vw, 2rem); margin: 0 0 32px; text-align: center; }
+h3 { font-size: 1.05rem; margin: 0 0 8px; }
+
+/* Header */
+
+.top {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 18px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.brand { display: flex; align-items: center; gap: 12px; text-decoration: none; font-size: 1.1rem; }
+.brand img { display: block; width: 36px; height: 36px; }
+
+nav { display: flex; gap: 24px; }
+nav a { text-decoration: none; color: var(--muted); font-size: 0.95rem; }
+nav a:hover { color: var(--text); }
+
+/* Hero */
+
+.hero { max-width: 1100px; margin: 0 auto; padding: 56px 24px 32px; text-align: center; }
+
+.hero h1 { font-size: clamp(2.6rem, 8vw, 4.75rem); margin: 0 0 20px; font-weight: 700; }
+
+.rainbow {
+  background: var(--rainbow);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.lead { font-size: clamp(1.05rem, 2.4vw, 1.3rem); color: var(--muted); max-width: 640px; margin: 0 auto 32px; }
+
+.downloads { display: flex; justify-content: center; flex-wrap: wrap; gap: 12px; }
+
+.button {
+  display: inline-block;
+  padding: 13px 26px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  text-decoration: none;
+  font-weight: 600;
+  transition: background 0.15s, border-color 0.15s;
+}
+.button:hover { border-color: var(--muted); }
+.button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.button:focus-visible, nav a:focus-visible, .brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+.fine { color: var(--muted); font-size: 0.9rem; margin: 16px 0 0; }
+
+/* Screenshots in a window frame */
+
+.window {
+  margin: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: 0 24px 60px -24px rgb(0 0 0 / 0.35);
+}
+.window img { display: block; width: 100%; height: auto; }
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  height: 34px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.titlebar span { margin-right: auto; }
+/* Minimise, maximise and close, drawn simply. */
+.titlebar i { width: 10px; height: 10px; border: 1.5px solid var(--muted); border-radius: 2px; opacity: 0.7; }
+.titlebar i:first-of-type { height: 0; border-width: 1.5px 0 0; border-radius: 0; }
+
+.hero-shot { max-width: 760px; margin: 56px auto 0; position: relative; isolation: isolate; }
+.hero-shot::before {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  z-index: -1;
+  border-radius: calc(var(--radius) + 2px);
+  background: var(--rainbow);
+  opacity: 0.55;
+  filter: blur(28px);
+}
+
+/* Features */
+
+.features, .install { max-width: 1100px; margin: 0 auto; padding: 72px 24px; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; }
+.grid.two { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+
+.grid article {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+}
+.grid article p { margin: 0; color: var(--muted); font-size: 0.97rem; }
+
+/* Showcase */
+
+.showcase {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px 24px 48px;
+  display: grid;
+  grid-template-columns: minmax(0, 480px) minmax(0, 1fr);
+  gap: 56px;
+  align-items: center;
+}
+.showcase-text h2 { text-align: left; margin-bottom: 16px; }
+.showcase-text > p { color: var(--muted); margin: 0 0 28px; }
+.window.small { max-width: 500px; }
+.caption { color: var(--muted); font-size: 0.9rem; margin: 14px 0 0; }
+
+/* Install */
+
+.install ol { margin: 0; padding-left: 20px; color: var(--muted); }
+.install li { margin-bottom: 10px; }
+.install strong { color: var(--text); }
+.install .fine { margin-top: 12px; }
+
+.privacy { max-width: 760px; margin: 28px auto 0; text-align: center; color: var(--muted); font-size: 0.92rem; }
+.privacy strong { color: var(--text); }
+
+code { font-family: Consolas, "Cascadia Mono", ui-monospace, monospace; font-size: 0.9em; }
+pre {
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  line-height: 1.7;
+}
+
+.badge {
+  display: inline-block;
+  font: 600 0.7rem/1 "Segoe UI", system-ui, sans-serif;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 4px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  vertical-align: middle;
+  margin-left: 6px;
+}
+
+/* Donations */
+
+.donate { max-width: 760px; margin: 0 auto; padding: 24px 24px 72px; }
+.donate-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; }
+.donate-card > p { margin: 0 0 24px; color: var(--muted); }
+.coin { margin-bottom: 20px; }
+.coin h3 { font-size: 0.95rem; margin-bottom: 8px; }
+.addr { display: flex; gap: 8px; }
+.addr code {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  word-break: break-all;
+  font-size: 0.85rem;
+  user-select: all;
+}
+.addr button {
+  flex: none;
+  min-width: 84px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font: 600 0.9rem "Segoe UI", system-ui, sans-serif;
+  cursor: pointer;
+}
+.addr button:hover { background: var(--accent-hover); }
+.addr button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.donate-card .note { margin: 4px 0 0; color: var(--muted); font-size: 0.85rem; }
+
+/* Footer */
+
+footer { border-top: 1px solid var(--border); padding: 28px 24px 40px; text-align: center; }
+footer p { margin: 0 auto 8px; max-width: 760px; color: var(--muted); font-size: 0.9rem; }
+
+/* Tablets and narrow windows: one column, so the screenshots stay readable. */
+
+@media (max-width: 980px) {
+  .showcase { grid-template-columns: 1fr; justify-items: center; gap: 40px; }
+  .showcase > .window { width: 100%; max-width: 480px; }
+  .showcase-text { max-width: 560px; text-align: center; }
+  .showcase-text h2 { text-align: center; }
+  .window.small { margin: 0 auto; }
+}
+
+/* Phones */
+
+@media (max-width: 760px) {
+  body { font-size: 16px; }
+  .top { padding: 14px 16px; }
+  nav { gap: 16px; }
+  nav a[href="#features"], nav a[href="#install"] { display: none; }
+  .donate { padding: 16px 16px 56px; }
+  .donate-card { padding: 20px; }
+  .addr { flex-direction: column; }
+  .addr button { min-height: 40px; }
+  .hero { padding: 36px 16px 24px; }
+  .hero-shot { margin-top: 40px; }
+  .button { width: 100%; max-width: 360px; text-align: center; }
+  .features, .install { padding: 56px 16px; }
+  .showcase { grid-template-columns: 1fr; gap: 32px; padding: 16px 16px 32px; }
+  .showcase-text h2 { text-align: center; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}

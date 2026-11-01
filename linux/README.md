@@ -1,6 +1,6 @@
 # HDR Ultimate for Linux
 
-Per-monitor HDR control with game detection, prompts, banners, OLED care and light/dark themes.
+Per-monitor HDR control with game detection, prompts, banners, OLED care, per-game resolution and refresh rate, and light/dark themes.
 
 ## Needs
 

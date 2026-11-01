@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HDR Ultimate</title>
+  <meta name="description" content="Free, lightweight tray app for per-monitor HDR control on Windows 10/11 and Linux: hotkeys, automatic HDR for games, OLED care and per-game display modes.">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <meta property="og:title" content="HDR Ultimate">
+  <meta property="og:description" content="Per-monitor HDR control for Windows and Linux, with automatic HDR for games.">
+  <meta property="og:image" content="https://hdrultra.help/img/logo-dark.png">
+  <meta property="og:url" content="https://hdrultra.help/">
+  <link rel="icon" href="img/logo-dark.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="./">
+      <picture>
+        <source srcset="img/logo-dark.png" media="(prefers-color-scheme: dark)">
+        <img src="img/logo-light.png" alt="" width="36" height="36">
+      </picture>
+      <span>HDR Ultimate</span>
+    </a>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#donate">Support</a>
+      <a href="https://discord.gg/CsxstrtyVS">Discord</a>
+      <a href="https://github.com/WillPidgeon/HDR-Ultimate">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>HDR <span class="rainbow">Ultimate</span></h1>
+      <p class="lead">Per-monitor HDR control from your system tray. HDR turns on when your game starts and off when it closes.</p>
+      <div class="downloads">
+        <a class="button primary" id="dl-windows" href="https://github.com/WillPidgeon/HDR-Ultimate/releases/latest/download/HDRUltimate.exe">
+          Download for Windows
+        </a>
+        <a class="button" id="dl-linux" href="https://github.com/WillPidgeon/HDR-Ultimate/releases/latest/download/HDRUltimate-Linux.tar.gz">
+          Linux (preview)
+        </a>
+      </div>
+      <p class="fine"><span id="version">Latest version</span> · Windows 10 and 11 · Free and open source</p>
+
+      <div class="hero-shot">
+        <figure class="window">
+          <div class="titlebar"><span>HDR Ultimate</span><i></i><i></i><i></i></div>
+          <picture>
+            <source srcset="img/settings-dark.png" media="(prefers-color-scheme: dark)">
+            <img src="img/settings-light.png" width="720" height="540" alt="HDR Ultimate's game list: each game, the monitors it uses, and whether HDR turns on automatically or asks first.">
+          </picture>
+        </figure>
+      </div>
+    </section>
+
+    <section id="features" class="features">
+      <h2>Everything HDR, one tray icon</h2>
+      <div class="grid">
+        <article>
+          <h3>Per-monitor hotkeys</h3>
+          <p>Toggle HDR on any one monitor, or a group of them, with a key combination or a click on the tray icon. The icon shows which monitors are on.</p>
+        </article>
+        <article>
+          <h3>Automatic HDR for games</h3>
+          <p>Add a game and HDR comes on when it starts, then goes back off when it closes. Have it ask first, or just do it. It reads the game's own HDR setting too.</p>
+        </article>
+        <article>
+          <h3>OLED care</h3>
+          <p>Tab out of a game and HDR switches off after a delay you choose, then comes back the moment you return. Less static brightness on screens that can burn in.</p>
+        </article>
+        <article>
+          <h3>Resolution and refresh rate per game</h3>
+          <p>Give a game its own resolution and refresh rate. Apply the resolution to the desktop while it runs, or write it into the game's settings.</p>
+        </article>
+        <article>
+          <h3>Tiny and quiet</h3>
+          <p>One small file, no installer and no background services. Light and dark themes that follow your system.</p>
+        </article>
+        <article>
+          <h3>Windows and Linux</h3>
+          <p>Built for Windows 10 and 11. A Linux version for KDE Plasma 6 and GNOME 48+ is in preview.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="showcase">
+      <figure class="window">
+        <div class="titlebar"><span>Edit HDR game</span><i></i><i></i><i></i></div>
+        <picture>
+          <source srcset="img/game-dark.png" media="(prefers-color-scheme: dark)">
+          <img src="img/game-light.png" width="480" height="582" loading="lazy" alt="A game's settings: its monitors, what happens when it starts and closes, OLED care, and its resolution and refresh rate.">
+        </picture>
+      </figure>
+      <div class="showcase-text">
+        <h2>Set it up once per game</h2>
+        <p>Pick the game's exe and its monitors. HDR Ultimate finds the game's settings file on its own and works out the rest.</p>
+        <figure class="window small">
+          <picture>
+            <source srcset="img/prompt-dark.png" media="(prefers-color-scheme: dark)">
+            <img src="img/prompt-light.png" width="500" height="140" loading="lazy" alt="A small prompt in the corner: Turn on HDR for Hogwarts Legacy? With Not now, Always for this game, and Turn on HDR buttons.">
+          </picture>
+        </figure>
+        <p class="caption">When a game asks first, a small prompt appears in the corner without taking focus from the game.</p>
+      </div>
+    </section>
+
+    <section id="install" class="install">
+      <h2>Install</h2>
+      <div class="grid two">
+        <article>
+          <h3>Windows</h3>
+          <ol>
+            <li>Download <code>HDRUltimate.exe</code> and run it. There's nothing to install.</li>
+            <li>If Windows shows "Windows protected your PC", choose <strong>More info</strong>, then <strong>Run anyway</strong>. That appears for apps from small developers without a paid signing certificate.</li>
+            <li>Find the icon in the system tray, and add your games in Settings.</li>
+          </ol>
+          <p class="fine">Needs a monitor that supports HDR.</p>
+        </article>
+        <article>
+          <h3>Linux <span class="badge">Preview</span></h3>
+          <pre><code>tar xzf HDRUltimate-Linux.tar.gz
+cd HDRUltimate-Linux
+sh install.sh</code></pre>
+          <p class="fine">Needs Wayland with KDE Plasma 6 or GNOME 48+, and Python 3.9 or newer.</p>
+        </article>
+      </div>
+      <p class="privacy"><strong>Privacy:</strong> HDR Ultimate checks in once a day, only to count how many people use it. Nothing about you, your PC, your games or your settings is sent, and you can opt out on first launch or any time in Settings.</p>
+    </section>
+
+    <section id="donate" class="donate">
+      <h2>Support the project</h2>
+      <div class="donate-card">
+        <p>HDR Ultimate is free and open source. If it's useful to you, donations are appreciated but never expected.</p>
+        <div class="coin">
+          <h3>Bitcoin (BTC)</h3>
+          <div class="addr"><code id="btc">bc1qeaxzwgxluv7cqd0vycfvev2djm233m8nk9f7yx</code><button type="button" data-copy="btc">Copy</button></div>
+        </div>
+        <div class="coin">
+          <h3>Ethereum (ETH)</h3>
+          <div class="addr"><code id="eth">0xBFB1fac92565B9B2A995D8bAb9B677fE8d9AB94F</code><button type="button" data-copy="eth">Copy</button></div>
+        </div>
+        <div class="coin">
+          <h3>XRP</h3>
+          <div class="addr"><code id="xrp">rKXSrHt2i6n4qPqgkQwWMhJVhW9A9PDX6R</code><button type="button" data-copy="xrp">Copy</button></div>
+        </div>
+        <p class="note">Crypto transactions can't be reversed. Double-check the address and the network before you send.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      <a href="https://github.com/WillPidgeon/HDR-Ultimate">Source code</a> · <a href="https://github.com/WillPidgeon/HDR-Ultimate/releases">All releases</a> ·
+      <a href="https://github.com/WillPidgeon/HDR-Ultimate/issues">Report a problem</a> · <a href="https://discord.gg/CsxstrtyVS">Discord</a>
+    </p>
+    <p>HDR Ultimate is free software under the <a href="https://github.com/WillPidgeon/HDR-Ultimate/blob/main/LICENSE">GNU GPL v3</a>. Copyright &copy; 2026 William Pidgeon.
+      Interface font: <a href="https://fonts.google.com/specimen/Orbitron">Orbitron</a> (SIL Open Font License).</p>
+  </footer>
+
+  <script>
+    // Show the latest release's version and link its files directly. The links above already work without this.
+    fetch("https://api.github.com/repos/WillPidgeon/HDR-Ultimate/releases/latest")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+      .then(function (release) {
+        var version = (release.name || release.tag_name || "").replace(/^v(ersion)?\s*/i, "");
+        if (version) document.getElementById("version").textContent = "Version " + version;
+        (release.assets || []).forEach(function (a) {
+          if (/\.exe$/i.test(a.name)) document.getElementById("dl-windows").href = a.browser_download_url;
+          if (/\.tar\.gz$/i.test(a.name)) document.getElementById("dl-linux").href = a.browser_download_url;
+        });
+      })
+      .catch(function () {});
+
+    // Copy buttons for the donation addresses.
+    document.querySelectorAll("button[data-copy]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var text = document.getElementById(b.dataset.copy).textContent;
+        if (!navigator.clipboard) return;
+        navigator.clipboard.writeText(text).then(function () {
+          b.textContent = "Copied";
+          setTimeout(function () { b.textContent = "Copy"; }, 1500);
+        }, function () {});
+      });
+    });
+  </script>
+</body>
+</html>
