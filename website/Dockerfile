@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY server.py ./
+COPY server.py admin.py countries.py ./
 COPY public ./public
 
 # Runs as an unprivileged user; the database lives in the /data volume.

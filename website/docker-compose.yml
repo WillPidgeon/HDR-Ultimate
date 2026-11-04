@@ -1,12 +1,10 @@
 # hdrultra.help: the site, plus a Cloudflare Tunnel so it's reachable without opening any router ports.
-# Put STATS_KEY and TUNNEL_TOKEN in a .env file next to this one (see .env.example), then: docker compose up -d --build
+# Put TUNNEL_TOKEN in a .env file next to this one (see .env.example), then: docker compose up -d --build
 
 services:
   web:
     build: .
     restart: unless-stopped
-    environment:
-      STATS_KEY: ${STATS_KEY:-}
     volumes:
       - usage-data:/data
     # No ports published: only the tunnel reaches it. To try it on your network first,

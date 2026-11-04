@@ -3,7 +3,11 @@
 The HDR Ultimate download page and daily user counter, as a Docker container behind a Cloudflare Tunnel. The tunnel connects out from your server to Cloudflare, so no router ports are opened and your home IP stays hidden.
 
 - `public/`: the page.
-- `server.py`: serves the page, plus `POST /ping` (the app's once-a-day check-in) and `GET /stats?key=...` (your private counts). Uses only Python's standard library. It keeps nothing but one number per day, and doesn't log requests.
+- `server.py`: serves the page, plus `POST /ping` (the app's once-a-day check-in). Uses only Python's standard library. It keeps nothing but one number per day, and doesn't log requests.
+- `admin.py`: the admin panel at `/admin`, with the daily user counts, website traffic by country and admin accounts. Only admins can sign in, and there's no sign-up.
+- `countries.py`: country names for the traffic table.
+
+Website traffic is counted from home page views, using the visitor's country from Cloudflare's `CF-IPCountry` header (IP Geolocation, on by default under **Network** in the Cloudflare dashboard). Only a total per day and country is kept: no IPs, no cookies.
 - `Dockerfile`, `docker-compose.yml`: the site container and the tunnel container.
 
 ## 1. Cloudflare (once)
@@ -33,7 +37,7 @@ Copy this folder to the Docker host, then in it:
 
 ```bash
 cp .env.example .env
-nano .env                 # fill in STATS_KEY and TUNNEL_TOKEN
+nano .env                 # fill in TUNNEL_TOKEN
 docker compose up -d --build
 ```
 
@@ -47,9 +51,17 @@ Copy the changed files over and run `docker compose up -d --build` again. The co
 
 After **Rotate token** in Cloudflare, run `bash set-token.sh` in this folder on the Docker host and paste the new token. It saves it to `.env` and restarts the tunnel.
 
-## See the counts
+## Admin panel
 
-Open `https://hdrultra.help/stats?key=<your STATS_KEY>`.
+Make the first admin account on the Docker host (it asks for a password, at least 8 characters):
+
+```bash
+docker compose exec web python admin.py add <name>
+```
+
+Then sign in at https://hdrultra.help/admin. From there you can see the counts, add or remove admins, and change your password. Sign-ins last 12 hours, and after 8 wrong passwords from one address, sign-in is blocked from there for 15 minutes.
+
+Locked out? On the Docker host, `docker compose exec web python admin.py password <name>` sets a new password, `... admin.py list` shows the accounts, and `... admin.py remove <name>` deletes one.
 
 ## Limits
 
