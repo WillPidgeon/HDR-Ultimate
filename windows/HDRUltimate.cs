@@ -26,7 +26,7 @@ namespace HdrUltimate
     // Each channel has its own name, settings folder and startup entry, so builds never touch each other's data.
     static class Build
     {
-        public const string Version = "1.2.0";
+        public const string Version = "1.3.4";
 #if DEV
         public const string Name = "HDR Ultimate Dev", Channel = "dev", RunName = "HDRUltimateDev", OldRunName = RunName;
         public const bool Dev = true, Release = false, InGameHdrColumn = true;
@@ -87,6 +87,17 @@ namespace HdrUltimate
         [STAThread]
         static void Main(string[] args)
         {
+#if DEV
+            if (args.Length > 0 && args[0] == "--dev-game")
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Theme.Init("system");
+                AppIcon.Letter = "G"; // the dev game's own icon in the taskbar and title bar
+                Application.Run(new DevGameWindow());
+                return;
+            }
+#endif
             if (args.Length > 1 && args[0] == "--make-icon")
             {
                 Theme.Set("dark");
@@ -110,7 +121,8 @@ namespace HdrUltimate
             bool created;
             using (var mutex = new Mutex(true, Build.RunName + "_SingleInstance_7f3a91", out created))
             {
-                if (!created)
+                // An older version still running gets closed, so a freshly downloaded update can take over.
+                if (!created && !OldVersions.CloseRunning(mutex))
                 {
                     MessageBox.Show("HDR Ultimate is already running. Look for its icon in the system tray.", Build.Name);
                     return;
@@ -307,6 +319,7 @@ namespace HdrUltimate
                 if (string.IsNullOrEmpty(m.DevicePath)) m.DevicePath = "name:" + m.Name + ":" + t.id;
 
                 ReadState(m);
+                if (StateHook != null) StateHook(m);
                 list.Add(m);
             }
             return list.OrderBy(x => x.GdiName ?? "").ToList();
@@ -335,12 +348,18 @@ namespace HdrUltimate
         public static bool SetHdr(MonitorInfo m, bool on)
         {
             bool ok = ApplyHdr(m, on);
+            ModeGuard.Touched(m.DevicePath); // Windows sets the display mode again when HDR switches
             Log.Write("Set HDR " + (on ? "on" : "off") + " on " + m.Name + ": " + (ok ? "ok" : "FAILED"));
             return ok;
         }
 
+        // Tests: a fake display world (HDR state and switching). Never set outside tests.
+        public static Action<MonitorInfo> StateHook;
+        public static Func<MonitorInfo, bool, bool> ApplyHook;
+
         static bool ApplyHdr(MonitorInfo m, bool on)
         {
+            if (ApplyHook != null) return ApplyHook(m, on);
             var s = new SET_STATE();
             s.value = on ? 1u : 0u;
             if (m.NewApi)
@@ -368,12 +387,73 @@ namespace HdrUltimate
         }
     }
 
-    enum ModeResult { Changed, AlreadySet, Failed }
+    enum ModeResult { Changed, AlreadySet, Deferred, Failed }
+
+    delegate int ChangeCall(string gdiName, ref DEVMODE dm, uint flags);
+
+    // Keeps display changes from piling up. Windows needs a moment after each one (longer with HDR), and in testing two
+    // changes in a row on one monitor stalled the NVIDIA driver for 30 seconds and blacked out every screen. So:
+    // - one change per monitor every few seconds, counting HDR switches (they make Windows set the mode too), and a
+    //   short gap between changes on any monitors; anything sooner waits for the next poll instead
+    // - a monitor where Windows struggles (a slow change, or two failures) gets no more mode changes this session.
+    //   HDR control keeps working; only resolution and refresh rate switching stops there.
+    static class ModeGuard
+    {
+        public static readonly TimeSpan MonitorGap = TimeSpan.FromSeconds(4), AnyGap = TimeSpan.FromSeconds(1.5), Slow = TimeSpan.FromSeconds(5);
+        public static Func<DateTime> Clock = () => DateTime.UtcNow; // tests replace this
+
+        static readonly Dictionary<string, DateTime> last = new Dictionary<string, DateTime>();
+        static readonly Dictionary<string, int> failures = new Dictionary<string, int>();
+        static readonly HashSet<string> blocked = new HashSet<string>();
+        static DateTime lastAny = DateTime.MinValue;
+        public static event Action<string> Blocked; // monitor name, once, when it's switched off
+
+        public static bool IsBlocked(string path) { return blocked.Contains(path); }
+
+        // How long until this monitor may change again (zero = now).
+        public static TimeSpan Wait(string path)
+        {
+            var now = Clock();
+            DateTime t;
+            var mine = last.TryGetValue(path, out t) ? t + MonitorGap - now : TimeSpan.Zero;
+            var any = lastAny + AnyGap - now;
+            var wait = mine > any ? mine : any;
+            return wait > TimeSpan.Zero ? wait : TimeSpan.Zero;
+        }
+
+        public static bool Ready(string path) { return !IsBlocked(path) && Wait(path) == TimeSpan.Zero; }
+
+        // Something changed this monitor's output: a mode change, or HDR switching.
+        public static void Touched(string path) { last[path] = lastAny = Clock(); }
+
+        public static void Result(string path, string name, bool ok, TimeSpan took)
+        {
+            Touched(path);
+            if (ok && took < Slow) { failures.Remove(path); return; }
+            int n;
+            failures[path] = n = (failures.TryGetValue(path, out n) ? n : 0) + 1;
+            if (took < Slow && n < 2) return;
+            if (!blocked.Add(path)) return;
+            Log.Write("Display mode changes on " + name + " are off for this session: " + (ok ? "a change took " + took.TotalSeconds.ToString("0.0") + " s" : "two changes failed"));
+            if (Blocked != null) Blocked(name);
+        }
+
+        public static void ResetForTests() { last.Clear(); failures.Clear(); blocked.Clear(); lastAny = DateTime.MinValue; Blocked = null; }
+    }
 
     // Resolution and refresh rate. Changes are temporary: Windows keeps the mode from Display settings,
     // and Reset goes back to it, so a reboot also undoes anything left behind.
     static class DisplayModes
     {
+        // Offered in the refresh rate picker on every monitor, as well as the monitor's own rates.
+        public static readonly int[] CommonRates = { 480, 390, 360, 300, 280, 240, 200, 180, 175, 165, 144, 120, 100, 75, 60 };
+
+        // The rate to use for a chosen one: itself if the monitor offers it, else the fastest offered below it (0 = none).
+        public static int Fallback(IEnumerable<int> offered, int hz)
+        {
+            return offered.Where(r => r <= hz).DefaultIfEmpty(0).Max();
+        }
+
         static DEVMODE Blank()
         {
             var dm = new DEVMODE();
@@ -395,42 +475,71 @@ namespace HdrUltimate
             return found.Values.OrderByDescending(m => m.Width * m.Height).ThenByDescending(m => m.Width).ThenByDescending(m => m.Hz).ToList();
         }
 
-        public static DisplayMode Current(string gdiName)
+        public static DisplayMode Current(string gdiName) { return Read(gdiName, Native.ENUM_CURRENT_SETTINGS); }
+
+        // Deliberately no "saved mode" from Windows (ENUM_REGISTRY_SETTINGS) and no NULL reset to it: those are kept per
+        // output name and after a restart can be another monitor's. The tray app remembers each monitor's own mode instead.
+
+        static DisplayMode Read(string gdiName, int which)
         {
+            if (ReadHook != null) return ReadHook(gdiName, which);
             var dm = Blank();
-            if (!Native.EnumDisplaySettings(gdiName, Native.ENUM_CURRENT_SETTINGS, ref dm)) return null;
+            if (!Native.EnumDisplaySettings(gdiName, which, ref dm)) return null;
             return new DisplayMode { Width = (int)dm.dmPelsWidth, Height = (int)dm.dmPelsHeight, Hz = (int)dm.dmDisplayFrequency };
         }
 
-        // Zero keeps that part as it is. A new resolution keeps the current refresh rate if it has it, otherwise its fastest.
+        // The actual Windows calls, swappable so tests never touch a real display.
+        public static ChangeCall Change = (string gdi, ref DEVMODE dm, uint flags) => Native.ChangeDisplaySettingsEx(gdi, ref dm, IntPtr.Zero, flags, IntPtr.Zero);
+        public static Func<string, int, DisplayMode> ReadHook; // tests: the current (-1) and saved (-2) modes of a fake display
+        const uint CDS_TEST = 0x2;
+
         public static ModeResult Set(MonitorInfo m, int width, int height, int hz)
         {
+            DisplayMode target;
+            return Set(m, width, height, hz, out target);
+        }
+
+        // Zero keeps that part as it is. A new resolution keeps the current refresh rate if it has it, otherwise its fastest.
+        // target: the mode it resolves to, also when the change has to wait (Deferred) for the monitor to settle.
+        // restoring: putting a monitor back in its own mode, which goes ahead even where mode changes are switched off.
+        public static ModeResult Set(MonitorInfo m, int width, int height, int hz, out DisplayMode target, bool restoring = false)
+        {
+            target = null;
             var dm = Blank();
             if (string.IsNullOrEmpty(m.GdiName) || !Native.EnumDisplaySettings(m.GdiName, Native.ENUM_CURRENT_SETTINGS, ref dm)) return ModeResult.Failed;
-            int w = width > 0 ? width : (int)dm.dmPelsWidth, h = width > 0 ? height : (int)dm.dmPelsHeight;
+            if (ModeGuard.IsBlocked(m.DevicePath) && !restoring) { Log.Write("Display mode changes on " + m.Name + " are off for this session"); return ModeResult.Failed; }
+            var cur = Current(m.GdiName); // the same read as everywhere else
+            if (cur == null) return ModeResult.Failed;
+            int w = width > 0 ? width : cur.Width, h = width > 0 ? height : cur.Height;
             var rates = List(m.GdiName).Where(x => x.Width == w && x.Height == h).Select(x => x.Hz).ToList();
-            int rate = hz > 0 ? hz : rates.Contains((int)dm.dmDisplayFrequency) ? (int)dm.dmDisplayFrequency : rates.DefaultIfEmpty(0).Max();
+            int rate = hz > 0 ? Fallback(rates, hz) : rates.Contains(cur.Hz) ? cur.Hz : rates.DefaultIfEmpty(0).Max();
+            if (hz > 0 && rate != hz && rate > 0) Log.Write(m.Name + " doesn't offer " + hz + " Hz at " + w + " × " + h + ", so using " + rate + " Hz");
             string text = DisplayMode.Describe(w, h, rate);
             if (!rates.Contains(rate))
             {
                 Log.Write("Display mode " + text + " isn't offered by " + m.Name);
                 return ModeResult.Failed;
             }
-            if (w == dm.dmPelsWidth && h == dm.dmPelsHeight && rate == dm.dmDisplayFrequency) return ModeResult.AlreadySet;
+            target = new DisplayMode { Width = w, Height = h, Hz = rate };
+            if (w == cur.Width && h == cur.Height && rate == cur.Hz) return ModeResult.AlreadySet;
+            if (ModeGuard.Wait(m.DevicePath) > TimeSpan.Zero) return ModeResult.Deferred; // too soon after the last change: the next poll does it
 
             dm.dmPelsWidth = (uint)w; dm.dmPelsHeight = (uint)h; dm.dmDisplayFrequency = (uint)rate;
             dm.dmFields = Native.DM_PELSWIDTH | Native.DM_PELSHEIGHT | Native.DM_DISPLAYFREQUENCY;
-            int err = Native.ChangeDisplaySettingsEx(m.GdiName, ref dm, IntPtr.Zero, 0, IntPtr.Zero);
-            Log.Write("Set display mode " + text + " on " + m.Name + ": " + (err == 0 ? "ok" : "FAILED (" + err + ")"));
+            // Ask Windows first whether it would accept the mode, without switching.
+            int test = Change(m.GdiName, ref dm, CDS_TEST);
+            if (test != 0)
+            {
+                Log.Write("Windows wouldn't accept " + text + " on " + m.Name + " (" + test + "), so it wasn't tried");
+                ModeGuard.Result(m.DevicePath, m.Name, false, TimeSpan.Zero);
+                return ModeResult.Failed;
+            }
+            var clock = Stopwatch.StartNew();
+            int err = Change(m.GdiName, ref dm, 0);
+            ModeGuard.Result(m.DevicePath, m.Name, err == 0, clock.Elapsed);
+            Log.Write("Set display mode " + text + " on " + m.Name + ": " + (err == 0 ? "ok" : "FAILED (" + err + ")") +
+                (clock.Elapsed > ModeGuard.Slow ? " after " + clock.Elapsed.TotalSeconds.ToString("0.0") + " s" : ""));
             return err == 0 ? ModeResult.Changed : ModeResult.Failed;
-        }
-
-        // Back to the mode chosen in Windows Display settings.
-        public static bool Reset(MonitorInfo m)
-        {
-            int err = Native.ChangeDisplaySettingsEx(m.GdiName, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
-            Log.Write("Restored display mode on " + m.Name + ": " + (err == 0 ? "ok" : "FAILED (" + err + ")"));
-            return err == 0;
         }
     }
 
@@ -486,6 +595,9 @@ namespace HdrUltimate
         public bool OledEnabled;        // master switch, offered on first run; each game can still opt out
         public bool UsageEnabled = true, UsageAsked; // daily check-in for the active user count; opt-out offered on first run
         public string UsageDay = "";    // UTC date of the last check-in
+        public bool UpdatesEnabled = true; // look for new releases on GitHub
+        public string UpdateNotified = ""; // newest version already announced, so each release is announced once
+        public string ExePath = "";     // where the exe ran from last time, so a new version can clear out the old one
 
         static string AppData { get { return Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); } }
         public static string Dir { get { return Path.Combine(AppData, Build.Name); } }
@@ -523,6 +635,9 @@ namespace HdrUltimate
                     else if (p[0] == "usage_enabled" && p.Length > 1) c.UsageEnabled = p[1] == "1";
                     else if (p[0] == "usage_asked" && p.Length > 1) c.UsageAsked = p[1] == "1";
                     else if (p[0] == "usage_day" && p.Length > 1) c.UsageDay = p[1];
+                    else if (p[0] == "updates_enabled" && p.Length > 1) c.UpdatesEnabled = p[1] == "1";
+                    else if (p[0] == "update_notified" && p.Length > 1) c.UpdateNotified = p[1];
+                    else if (p[0] == "exe_path" && p.Length > 1) c.ExePath = p[1];
                     else if (p[0] == "oled_minutes" && p.Length > 1)
                         c.OledMinutes = Math.Max(OledMinMinutes, Math.Min(OledMaxMinutes, int.Parse(p[1])));
                     else if (p[0] == "bind" && p.Length > 3)
@@ -617,6 +732,9 @@ namespace HdrUltimate
             sb.AppendLine("usage_enabled\t" + (UsageEnabled ? "1" : "0"));
             sb.AppendLine("usage_asked\t" + (UsageAsked ? "1" : "0"));
             sb.AppendLine("usage_day\t" + UsageDay);
+            sb.AppendLine("updates_enabled\t" + (UpdatesEnabled ? "1" : "0"));
+            sb.AppendLine("update_notified\t" + UpdateNotified);
+            sb.AppendLine("exe_path\t" + ExePath);
             sb.AppendLine("oled_minutes\t" + OledMinutes);
             foreach (var b in Bindings)
             {
@@ -694,6 +812,357 @@ namespace HdrUltimate
             catch (Exception ex) { Log.Write("Usage check-in failed: " + ex.Message); return false; }
         }
     }
+
+    // Looks up the latest GitHub release every few hours and reports it when it's newer than this build.
+    static class Updates
+    {
+        const string Api = "https://api.github.com/repos/WillPidgeon/HDR-Ultimate/releases/latest";
+        public const string ReleasesPage = "https://github.com/WillPidgeon/HDR-Ultimate/releases/latest";
+        // Test builds only check a test server named in this variable.
+        const string TestVariable = "HDRULTIMATE_UPDATE_TEST_URL";
+        static readonly Regex TagField = new Regex("\"tag_name\"\\s*:\\s*\"([^\"]+)\"");
+        static readonly Regex PageField = new Regex("\"html_url\"\\s*:\\s*\"(https://github\\.com/WillPidgeon/HDR-Ultimate/releases/[^\"]+)\"");
+
+        public static bool Offered { get { return Url != ""; } }
+        static string Url { get { return Build.Release ? Api : Environment.GetEnvironmentVariable(TestVariable) ?? ""; } }
+
+        public static string Latest, Page; // set once a newer release turns up
+        public static event Action Found;
+
+        static DateTime nextTry = DateTime.UtcNow.AddSeconds(15); // a moment after launch, not while everything is starting
+        static bool checking;
+
+        // From the poll timer.
+        public static void Tick(Config cfg)
+        {
+            if (!Offered || !cfg.UpdatesEnabled || checking || DateTime.UtcNow < nextTry) return;
+            checking = true;
+            string url = Url;
+            var ui = SynchronizationContext.Current;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string tag, page;
+                bool ok = Fetch(url, out tag, out page);
+                ui.Post(__ =>
+                {
+                    checking = false;
+                    nextTry = DateTime.UtcNow + (ok ? TimeSpan.FromHours(6) : TimeSpan.FromMinutes(30));
+                    if (!ok || !IsNewer(tag, Build.Version) || Parse(tag).ToString() == Latest) return;
+                    Latest = Parse(tag).ToString();
+                    Page = page;
+                    Log.Write("Update available: " + Latest);
+                    if (Found != null) Found();
+                }, null);
+            });
+        }
+
+        static bool Fetch(string url, out string tag, out string page)
+        {
+            tag = page = null;
+            try
+            {
+                ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.UserAgent = "HDRUltimate"; // GitHub refuses requests without one
+                req.Accept = "application/vnd.github+json";
+                req.Timeout = 15000;
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                {
+                    string json = reader.ReadToEnd();
+                    var t = TagField.Match(json);
+                    if (!t.Success) return false;
+                    tag = t.Groups[1].Value;
+                    var p = PageField.Match(json);
+                    page = p.Success ? p.Groups[1].Value : ReleasesPage; // only ever a link to this project's releases
+                    return true;
+                }
+            }
+            catch (Exception ex) { Log.Write("Update check failed: " + ex.Message); return false; }
+        }
+
+        static string Clean(string tag) { return tag.Trim().TrimStart('v', 'V'); }
+
+        // "V1.2" and "1.2.0" are the same version (System.Version alone ranks 1.2 below 1.2.0).
+        static Version Parse(string text)
+        {
+            Version v;
+            return Version.TryParse(Clean(text), out v) ? new Version(v.Major, v.Minor, Math.Max(0, v.Build)) : null;
+        }
+
+        public static bool IsNewer(string candidate, string current)
+        {
+            Version a = Parse(candidate), b = Parse(current);
+            return a != null && b != null && a > b;
+        }
+
+        public static void Open()
+        {
+            try { Process.Start(Page ?? ReleasesPage); } catch (Exception ex) { Log.Write("Couldn't open the release page: " + ex.Message); }
+        }
+
+#if DEV
+        // Dev tab: acts as if the next minor version had just been released (notice, tray menu item, Settings row).
+        public static void Pretend()
+        {
+            var v = Version.Parse(Build.Version);
+            Latest = v.Major + "." + (v.Minor + 1) + ".0";
+            Page = ReleasesPage;
+            if (Found != null) Found();
+        }
+#endif
+    }
+
+    // After an update: closes the old version if it's still running, then moves the old exe to the Recycle Bin.
+    // Only exes of this same build channel and an older version are touched.
+    static class OldVersions
+    {
+        static string closedPath; // exe of the old version closed at launch
+        // Dev builds are kept side by side, one per version, so a newer one only closes an older one, never removes it.
+        public static bool KeepFiles = Build.Dev;
+
+        static Version VersionOf(string exe)
+        {
+            try
+            {
+                var info = FileVersionInfo.GetVersionInfo(exe);
+                Version v;
+                return info.ProductName == Build.Name && Version.TryParse(info.FileVersion, out v) ? v : null;
+            }
+            catch { return null; }
+        }
+
+        static Version Current { get { return new Version(Build.Version + ".0"); } }
+
+        static bool Same(string a, string b)
+        {
+            try { return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
+            catch { return false; }
+        }
+
+        // Called when another copy already holds the single-instance lock. Returns true once an older copy has been
+        // closed and the lock is ours; false if the running copy is this version or newer, or the user said no.
+        public static bool CloseRunning(Mutex mutex)
+        {
+            var me = Process.GetCurrentProcess();
+            Process old = null;
+            Version oldVersion = null;
+            foreach (var p in Process.GetProcesses())
+            {
+                if (p.Id == me.Id) continue;
+                string exe;
+                try { exe = p.MainModule.FileName; } catch { continue; } // another user's or a protected process
+                if (Path.GetFileName(exe).Equals("DevGame.exe", StringComparison.OrdinalIgnoreCase)) continue; // the dev build's test game
+                var v = VersionOf(exe);
+                if (v == null) continue;
+                if (v >= Current) return false;
+                old = p;
+                oldVersion = v;
+            }
+            if (old == null) return false;
+
+            string oldExe = old.MainModule.FileName;
+            var answer = MessageBox.Show(Build.Name + " " + Short(oldVersion) + " is still running.\n\nClose it and switch to " + Build.Version + "?" +
+                (KeepFiles ? "" : " The old version will be moved to the Recycle Bin."), Build.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (answer != DialogResult.Yes) return false;
+
+            Log.Write("Closing old version " + oldVersion + " at " + oldExe);
+            try
+            {
+                // 1.3.0 and later shut down cleanly on this signal; older versions are stopped.
+                using (var signal = EventWaitHandle.OpenExisting(Build.RunName + "_Exit_7f3a91")) signal.Set();
+            }
+            catch (WaitHandleCannotBeOpenedException) { }
+            catch (Exception ex) { Log.Write("Exit signal failed: " + ex.Message); }
+            try
+            {
+                if (!old.WaitForExit(8000)) { old.Kill(); old.WaitForExit(5000); }
+            }
+            catch (Exception ex) { Log.Write("Couldn't close the old version: " + ex.Message); }
+
+            try { if (!mutex.WaitOne(5000)) return false; }
+            catch (AbandonedMutexException) { } // the old copy was stopped while holding it; it's ours now
+            closedPath = oldExe;
+            return true;
+        }
+
+        static string Short(Version v) { return v.Major + "." + v.Minor + "." + Math.Max(0, v.Build); }
+
+        // Returns the version moved to the Recycle Bin, or null if there was nothing to clear out.
+        public static string Cleanup(Config cfg, string startupPath)
+        {
+            string me = Application.ExecutablePath;
+            string removed = null;
+            foreach (var path in new[] { closedPath, cfg.ExePath, startupPath }.Where(p => !string.IsNullOrEmpty(p)).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (Same(path, me) || !File.Exists(path)) continue;
+                var v = VersionOf(path);
+                if (v == null || v >= Current || KeepFiles) continue; // not ours, not older, or a dev build: leave it alone
+                if (Recycle(path)) removed = Short(v);
+            }
+            if (cfg.ExePath != me) { cfg.ExePath = me; cfg.Save(); }
+            return removed;
+        }
+
+        static bool Recycle(string path)
+        {
+            // The file can stay locked for a moment after the old copy exits.
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                try
+                {
+                    // Can it be deleted at all? (Locked, or in a folder the user can't change, such as Program Files.)
+                    using (File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                    Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(path,
+                        Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+                    Log.Write("Moved the old version to the Recycle Bin: " + path);
+                    return true;
+                }
+                catch (IOException) { Thread.Sleep(300); }
+                catch (Exception ex) { Log.Write("Couldn't remove the old version at " + path + ": " + ex.Message); return false; }
+            }
+            Log.Write("The old version at " + path + " stayed locked, so it was left in place");
+            return false;
+        }
+    }
+
+#if DEV
+    // A stand-in game for trying display modes, HDR and OLED care without a real game. It's a copy of this exe,
+    // so game detection sees an exe of its own, with an Unreal-style settings file next to it for in-game settings.
+    static class DevGame
+    {
+        public const string Name = "Dev Game";
+        public static bool AutoInstall = true; // tests turn this off
+        public static string Folder { get { return Path.Combine(Config.Dir, "Dev game"); } }
+        public static string ExePath { get { return Path.Combine(Folder, "DevGame.exe"); } }
+        public static string SettingsPath { get { return Path.Combine(Folder, "GameUserSettings.ini"); } }
+
+        public static bool Running { get { return Process.GetProcessesByName("DevGame").Length > 0; } }
+
+        // The entry for the HDR games list: every HDR monitor, HDR on automatically.
+        public static Game NewEntry()
+        {
+            var g = new Game { ExePath = ExePath, Name = Name, ConfigPath = SettingsPath, Ask = false };
+            foreach (var m in Hdr.GetMonitors().Where(m => m.HdrSupported)) g.Monitors[m.DevicePath] = m.Name;
+            return g;
+        }
+
+        // At every dev launch: puts the game's exe and settings file in place, and the game in the HDR games list
+        // if it isn't there, so it's ready to set up and launch.
+        public static void Install(Config cfg)
+        {
+            try
+            {
+                Directory.CreateDirectory(Folder);
+                if (!Running) File.Copy(Application.ExecutablePath, ExePath, true); // always this build
+                if (!File.Exists(SettingsPath))
+                {
+                    var size = Screen.PrimaryScreen.Bounds.Size;
+                    File.WriteAllText(SettingsPath, "[/Script/Engine.GameUserSettings]\r\nbUseHDRDisplayOutput=True\r\n" +
+                        "ResolutionSizeX=" + size.Width + "\r\nResolutionSizeY=" + size.Height + "\r\nFullscreenMode=1\r\n");
+                }
+            }
+            catch (Exception ex) { Log.Write("Dev game setup failed: " + ex.Message); }
+            if (cfg.Games.Any(g => string.Equals(g.ExePath, ExePath, StringComparison.OrdinalIgnoreCase))) return;
+            cfg.Games.Add(NewEntry());
+            cfg.Save();
+        }
+
+        public static void Launch(Config cfg)
+        {
+            Install(cfg);
+            // The dev build is a console app; the game shouldn't bring a console window with it.
+            Process.Start(new ProcessStartInfo(ExePath, "--dev-game") { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Folder });
+        }
+
+        public static void CloseAll()
+        {
+            foreach (var p in Process.GetProcessesByName("DevGame"))
+                using (p) { if (!p.CloseMainWindow() || !p.WaitForExit(3000)) try { p.Kill(); } catch { } }
+        }
+
+        // The settings file's resolution and HDR switch, as the game sees them.
+        public static string Read(string key)
+        {
+            try
+            {
+                var m = Regex.Match(File.ReadAllText(SettingsPath), "^" + key + "=(.*)$", RegexOptions.Multiline);
+                return m.Success ? m.Groups[1].Value.Trim() : null;
+            }
+            catch { return null; }
+        }
+
+        public static void Write(string key, string value)
+        {
+            string text = File.Exists(SettingsPath) ? File.ReadAllText(SettingsPath) : "[/Script/Engine.GameUserSettings]\r\n";
+            var re = new Regex("^" + key + "=.*$", RegexOptions.Multiline);
+            text = re.IsMatch(text) ? re.Replace(text, key + "=" + value) : text.TrimEnd() + "\r\n" + key + "=" + value + "\r\n";
+            File.WriteAllText(SettingsPath, text);
+        }
+    }
+
+    // The dev game's window: shows what HDR Ultimate has done to the monitor it's on, live.
+    class DevGameWindow : ThemedForm
+    {
+        readonly Label monitor = new Label(), desktop = new Label(), hdr = new Label(), inGameRes = new Label(), inGameHdr = new Label();
+        readonly Button hdrButton;
+        readonly System.Windows.Forms.Timer refresh = new System.Windows.Forms.Timer { Interval = 1000 };
+
+        public DevGameWindow()
+        {
+            Text = DevGame.Name;
+            Icon = AppIcon.Get();
+            Font = HeaderFont.Body;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(560, 380);
+            MinimumSize = new Size(480, 360);
+
+            Controls.Add(new HeaderLabel { Text = "DEV GAME", Font = HeaderFont.Get(20f), Location = new Point(24, 18), Size = new Size(400, 44) });
+            Controls.Add(new Label { Text = "HDR Ultimate detects this window as a game. Move it between monitors, tab out, or close it.",
+                Location = new Point(26, 64), Size = new Size(510, 40), Tag = "muted" });
+            int y = 112;
+            foreach (var row in new[] { Tuple.Create("Monitor", monitor), Tuple.Create("Desktop mode", desktop), Tuple.Create("Windows HDR", hdr),
+                                        Tuple.Create("In-game resolution", inGameRes), Tuple.Create("In-game HDR", inGameHdr) })
+            {
+                Controls.Add(new Label { Text = row.Item1, Location = new Point(26, y), AutoSize = true, Tag = "muted" });
+                row.Item2.Location = new Point(200, y);
+                row.Item2.AutoSize = true;
+                Controls.Add(row.Item2);
+                y += 34;
+            }
+            hdrButton = new Button { Location = new Point(24, y + 14), Size = new Size(190, 34) };
+            hdrButton.Click += (s, e) => { DevGame.Write("bUseHDRDisplayOutput", HdrInGame ? "False" : "True"); Update(); };
+            var open = new Button { Text = "Open settings file", Location = new Point(222, y + 14), Size = new Size(170, 34) };
+            open.Click += (s, e) => Process.Start("notepad.exe", "\"" + DevGame.SettingsPath + "\"");
+            var close = new Button { Text = "Close game", Location = new Point(400, y + 14), Size = new Size(130, 34), Tag = "primary" };
+            close.Click += (s, e) => Close();
+            Controls.AddRange(new Control[] { hdrButton, open, close });
+
+            refresh.Tick += (s, e) => Update();
+            refresh.Start();
+            Move += (s, e) => Update();
+            Update();
+        }
+
+        static bool HdrInGame { get { return string.Equals(DevGame.Read("bUseHDRDisplayOutput"), "True", StringComparison.OrdinalIgnoreCase); } }
+
+        new void Update()
+        {
+            var screen = Screen.FromControl(this);
+            var m = Hdr.GetMonitors().FirstOrDefault(x => x.GdiName == screen.DeviceName);
+            var mode = DisplayModes.Current(screen.DeviceName);
+            monitor.Text = m != null ? m.Label : screen.DeviceName;
+            desktop.Text = mode != null ? DisplayMode.Describe(mode.Width, mode.Height, mode.Hz) : "unknown";
+            hdr.Text = m == null || !m.HdrSupported ? "not supported" : m.HdrOn ? "ON" : "off";
+            string w = DevGame.Read("ResolutionSizeX"), h = DevGame.Read("ResolutionSizeY");
+            inGameRes.Text = w != null && h != null ? w + " × " + h : "not set";
+            inGameHdr.Text = HdrInGame ? "on" : "off";
+            hdrButton.Text = HdrInGame ? "Turn in-game HDR off" : "Turn in-game HDR on";
+        }
+
+        protected override void Dispose(bool disposing) { if (disposing) refresh.Dispose(); base.Dispose(disposing); }
+    }
+#endif
 
     static class Hotkeys
     {
@@ -1035,8 +1504,12 @@ namespace HdrUltimate
 
     static class GameWatcher
     {
+        public static Func<List<Game>, List<Game>> RunningHook; // tests: pretend games are running
+        public static Func<List<Game>, Game> ForegroundHook;
+
         public static List<Game> Running(List<Game> games)
         {
+            if (RunningHook != null) return RunningHook(games);
             var found = new HashSet<Game>();
             if (games.Count == 0) return found.ToList();
             var byName = games.GroupBy(g => Path.GetFileNameWithoutExtension(g.ExePath), StringComparer.OrdinalIgnoreCase)
@@ -1061,6 +1534,7 @@ namespace HdrUltimate
         // launcher exe can start the real game from a subfolder (Hogwarts Legacy does).
         public static Game Foreground(List<Game> games)
         {
+            if (ForegroundHook != null) return ForegroundHook(games);
             uint pid;
             IntPtr window = Native.GetForegroundWindow();
             if (window == IntPtr.Zero || Native.GetWindowThreadProcessId(window, out pid) == 0 || pid == 0) return null;
@@ -1095,12 +1569,31 @@ namespace HdrUltimate
         // OLED care: when each watched monitor's game last had focus, and the monitors it has turned off.
         readonly Dictionary<string, DateTime> lastFocused = new Dictionary<string, DateTime>();
         readonly HashSet<string> oledOff = new HashSet<string>();
-        // Monitors whose display mode we changed (monitor path -> exe paths holding it).
+        // Monitors whose display mode we changed (monitor path -> exe paths holding it), and the mode each should keep.
         readonly Dictionary<string, HashSet<string>> modeSet = new Dictionary<string, HashSet<string>>();
+        readonly Dictionary<string, DisplayMode> modeWanted = new Dictionary<string, DisplayMode>();
+        readonly Dictionary<string, DisplayMode> modeLastSet = new Dictionary<string, DisplayMode>(); // the last mode we switched each to
+        readonly Dictionary<string, List<DateTime>> reapplies = new Dictionary<string, List<DateTime>>();
+        // HDR switches waiting for their monitor to settle in its own mode (monitor path -> on?, what to do after).
+        readonly Dictionary<string, Tuple<bool, Action<MonitorInfo, bool>>> hdrPending = new Dictionary<string, Tuple<bool, Action<MonitorInfo, bool>>>();
+        readonly Dictionary<string, DisplayMode> modeOwn = new Dictionary<string, DisplayMode>(); // each monitor's mode from before a game (see OwnOf)
+        readonly HashSet<string> restoreWaiting = new HashSet<string>(); // monitors to put back in their own mode
+        // The display mode setting each running game started with, so a change made while it runs is applied straight away.
+        readonly Dictionary<string, string> modeApplied = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // A newer version that's starting up sets this to ask us to close.
+        readonly EventWaitHandle exitSignal = new EventWaitHandle(false, EventResetMode.AutoReset, Build.RunName + "_Exit_7f3a91");
+        bool updateBalloon; // the balloon showing is the update notice, so clicking it opens the release page
+#if DEV
+        public static Action<string, string> DevBalloon; // lets the Dev tab show tray notices
+#endif
 
         public TrayApp()
         {
             cfg = Config.Load();
+#if DEV
+            if (DevGame.AutoInstall) DevGame.Install(cfg);
+#endif
+            string startupPath = Startup.RegisteredPath();
             Theme.Init(cfg.Theme);
             bool found = false;
             foreach (var g in cfg.Games.Where(g => string.IsNullOrEmpty(g.ConfigPath)))
@@ -1119,12 +1612,28 @@ namespace HdrUltimate
 
             tray = new NotifyIcon { Icon = AppIcon.Get(), Text = Build.Name, ContextMenuStrip = menu, Visible = true };
             tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) OpenSettings(); };
+            tray.BalloonTipClicked += (s, e) => { if (updateBalloon) Updates.Open(); };
+            tray.BalloonTipClosed += (s, e) => updateBalloon = false;
+            Updates.Found += AnnounceUpdate;
+            ModeGuard.Blocked += name => Notify("Windows had trouble switching " + name + "'s display mode, so HDR Ultimate won't change it again " +
+                                                "until it restarts. HDR still works as normal.", 9000);
+#if DEV
+            DevBalloon = (title, text) => Balloon(title, text, ToolTipIcon.Info);
+#endif
 
             // HDR can also be changed from Windows Settings or Win+Alt+B, so keep the indicator in sync.
             CheckGames();
             UpdateIndicator();
-            poll.Tick += (s, e) => { CheckGames(); CheckOledCare(); UpdateIndicator(); Usage.Tick(cfg); };
+            poll.Tick += (s, e) =>
+            {
+                if (exitSignal.WaitOne(0)) { Log.Write("Closing for a newer version"); ExitThread(); return; }
+                CheckGames(); UpdateRunningModes(); CheckOledCare(); SwitchPendingHdr(); RestorePending(); KeepModes(); UpdateIndicator(); Usage.Tick(cfg); Updates.Tick(cfg);
+            };
             poll.Start();
+
+            string replaced = OldVersions.Cleanup(cfg, startupPath);
+            if (replaced != null)
+                Balloon("Updated to " + Build.Version, "The old version (" + replaced + ") was moved to the Recycle Bin.", ToolTipIcon.Info);
 
             if (!cfg.StartupAsked && !Build.Dev)
             {
@@ -1161,7 +1670,22 @@ namespace HdrUltimate
             var failed = RegisterAll();
             if (cfg.Bindings.Count == 0 && cfg.Games.Count == 0) OpenSettings();
             else if (failed.Count > 0)
-                tray.ShowBalloonTip(5000, Build.Name, "These hotkeys are already used by another app: " + string.Join(", ", failed), ToolTipIcon.Warning);
+                Balloon(Build.Name, "These hotkeys are already used by another app: " + string.Join(", ", failed), ToolTipIcon.Warning);
+        }
+
+        void Balloon(string title, string text, ToolTipIcon icon, bool update = false)
+        {
+            updateBalloon = update;
+            tray.ShowBalloonTip(update ? 15000 : 5000, title, text, icon);
+        }
+
+        // Each release is announced once; after that it stays in the tray menu and Settings until updated.
+        void AnnounceUpdate()
+        {
+            if (cfg.UpdateNotified == Updates.Latest) return;
+            cfg.UpdateNotified = Updates.Latest;
+            cfg.Save();
+            Balloon(Build.Name + " " + Updates.Latest + " is out", "Click here to get it from GitHub.", ToolTipIcon.Info, true);
         }
 
         public List<string> RegisterAll()
@@ -1211,7 +1735,17 @@ namespace HdrUltimate
         void GameStarted(Game g)
         {
             Log.Write("Game started: " + g.Name + " (" + g.ExePath + ")");
-            ApplyMode(g);
+            modeApplied[g.ExePath] = ModeSetting(g);
+            // HDR first: switching HDR makes Windows set the display mode itself, which would undo a mode changed
+            // before it. The game's mode follows in one change once the monitor has settled (see ModeGuard).
+            bool quiet = StartHdr(g);
+            string notice = ApplyMode(g);
+            if (notice != null && !quiet) Notify(notice);
+        }
+
+        // Returns true when the mode notice should stay quiet: the HDR banner shows the mode, or a more important message did.
+        bool StartHdr(Game g)
+        {
             // Monitors already switched on for another running game just pick up this game as a holder too.
             foreach (var path in g.Monitors.Keys)
             {
@@ -1219,7 +1753,7 @@ namespace HdrUltimate
                 if (autoOn.TryGetValue(path, out holders)) holders.Add(g.ExePath);
             }
             var off = Hdr.GetMonitors().Where(m => m.HdrSupported && g.Monitors.ContainsKey(m.DevicePath) && !m.HdrOn).ToList();
-            if (off.Count == 0) return; // HDR already on everywhere this game wants it
+            if (off.Count == 0) return false; // HDR already on everywhere this game wants it
 
             string file;
             bool? inGame = GameConfig.HdrEnabled(g, out file);
@@ -1227,9 +1761,13 @@ namespace HdrUltimate
             if (inGame == false && g.SkipIfOff)
             {
                 Notify(g.Name + ": HDR is off in the game's settings  ·  Windows HDR left off", 7000); // needs reading, unlike a quick status
-                return;
+                return true;
             }
-            if (!g.Ask) { EnableFor(g); return; }
+            if (!g.Ask)
+            {
+                EnableFor(g);
+                return cfg.ShowOsd && off.Any(m => m.DevicePath == g.ModeMonitor); // the banner on that monitor shows it
+            }
 
             var prompt = new GamePrompt(g, off.Select(m => m.Name).ToList(), inGame);
             prompt.Answered += answer =>
@@ -1240,34 +1778,142 @@ namespace HdrUltimate
             };
             prompts[g.ExePath] = prompt;
             prompt.Show();
+            return false;
         }
 
         // Switches the game's monitor to its resolution and refresh rate. A monitor already in that mode
-        // is left alone afterwards too, the same as HDR.
-        void ApplyMode(Game g)
+        // is left alone afterwards too, the same as HDR. Returns the notice to show for a change, or null.
+        // ownSize: use the monitor's own (Windows Display settings) resolution where the game doesn't set one,
+        // instead of keeping whatever is current.
+        string ApplyMode(Game g, bool ownSize = false)
         {
-            if (!g.HasMode || (g.DesktopWidth == 0 && g.ModeHz == 0)) return; // in-game resolution only: written when the game closes
+            if (!g.HasMode || (g.DesktopWidth == 0 && g.ModeHz == 0)) return null; // in-game resolution only: written when the game closes
             var m = Hdr.GetMonitors().FirstOrDefault(x => x.DevicePath == g.ModeMonitor);
-            if (m == null) { Log.Write("Display mode for " + g.Name + ": monitor not connected"); return; }
-            var result = DisplayModes.Set(m, g.DesktopWidth, g.DesktopHeight, g.ModeHz);
+            if (m == null) { Log.Write("Display mode for " + g.Name + ": monitor not connected"); return null; }
+            int width = g.DesktopWidth, height = g.DesktopHeight;
+            if (!modeSet.ContainsKey(m.DevicePath) && !modeOwn.ContainsKey(m.DevicePath)) modeOwn[m.DevicePath] = DisplayModes.Current(m.GdiName);
+            var own = OwnOf(modeOwn, m);
+            if (ownSize && width == 0 && own != null) { width = own.Width; height = own.Height; }
+            DisplayMode target;
+            var result = DisplayModes.Set(m, width, height, g.ModeHz, out target);
             if (result == ModeResult.Failed)
             {
-                Notify(g.Name + "  ·  couldn't switch " + m.Name + " to " + DisplayMode.Describe(g.DesktopWidth, g.DesktopHeight, g.ModeHz), 7000);
-                return;
+                if (!ModeGuard.IsBlocked(m.DevicePath)) // that has its own notice
+                    Notify(g.Name + "  ·  couldn't switch " + m.Name + " to " + DisplayMode.Describe(width, height, g.ModeHz), 7000);
+                return null;
             }
             HashSet<string> holders;
             if (!modeSet.TryGetValue(m.DevicePath, out holders))
             {
-                if (result == ModeResult.AlreadySet) return;
+                if (result == ModeResult.AlreadySet) { if (!restoreWaiting.Contains(m.DevicePath)) modeOwn.Remove(m.DevicePath); return null; }
+                restoreWaiting.Remove(m.DevicePath);
                 modeSet[m.DevicePath] = holders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             }
             holders.Add(g.ExePath);
-            var now = DisplayModes.Current(m.GdiName);
-            if (result == ModeResult.Changed && now != null)
-                Notify(g.Name + "  ·  " + DisplayMode.Describe(now.Width, now.Height, now.Hz) + "  ·  " + m.Name);
+            modeWanted[m.DevicePath] = target; // ours to keep; a Deferred change is made by the next poll (KeepModes)
+            if (result != ModeResult.Changed) return null;
+            modeLastSet[m.DevicePath] = target;
+            return g.Name + "  ·  " + DisplayMode.Describe(target.Width, target.Height, target.Hz) + "  ·  " + m.Name;
         }
 
-        // Puts back the Windows display mode once no running game holds the monitor. Returns the monitors restored.
+        // The part of a game's display mode setting that applies while it runs (in-game resolution waits for it to close).
+        static string ModeSetting(Game g)
+        {
+            return g.HasMode && (g.DesktopWidth > 0 || g.ModeHz > 0) ? g.ModeMonitor + "|" + g.DesktopWidth + "x" + g.DesktopHeight + "@" + g.ModeHz : "";
+        }
+
+        // A running game's resolution or refresh rate was changed in Settings: switch to the new one now.
+        void UpdateRunningModes()
+        {
+            foreach (var exe in runningGames.Keys.ToList())
+            {
+                // cfg.Games, because editing a running game replaces its object.
+                var g = cfg.Games.FirstOrDefault(x => string.Equals(x.ExePath, exe, StringComparison.OrdinalIgnoreCase));
+                string before, now = g != null ? ModeSetting(g) : "";
+                if (g == null || !modeApplied.TryGetValue(exe, out before) || before == now) continue;
+                modeApplied[exe] = now;
+                Log.Write("Display mode for " + g.Name + " changed while it runs: " + (now == "" ? "none" : now));
+                // Same monitor: switch straight to the new mode, in one change (two back to back can stall Windows).
+                // When the resolution goes back to "Don't change", that's the monitor's own resolution, not the game's.
+                // Another monitor, or none: put the old monitor back first.
+                bool restored = false;
+                bool sizeDropped = !before.Contains("|0x") && g.DesktopWidth == 0;
+                if (now == "" || before.Split('|')[0] != g.ModeMonitor)
+                    restored = RestoreModes(exe, Hdr.GetMonitors()).Count > 0;
+                string notice = now != "" ? ApplyMode(g, sizeDropped) : null;
+                if (notice != null) Notify(notice);
+                else if (restored) Notify(g.Name + "  ·  display mode restored");
+            }
+        }
+
+        static bool SameMode(DisplayMode a, DisplayMode b) { return a != null && b != null && a.Width == b.Width && a.Height == b.Height && a.Hz == b.Hz; }
+
+        // Makes the game modes that had to wait (ModeGuard), and switches back a monitor that Windows put back in its
+        // saved mode, which it does whenever HDR switches. Runs on every poll. It never fights the user: a monitor
+        // set to something else (in Display settings, say) is left as they set it, and one that keeps getting
+        // put back is given up on rather than switched over and over.
+        void KeepModes()
+        {
+            if (modeWanted.Count == 0) return;
+            var mons = Hdr.GetMonitors();
+            foreach (var kv in modeWanted.ToList())
+            {
+                string path = kv.Key;
+                // Not while HDR is waiting to switch (it needs the monitor's own mode), nor while OLED care has it off.
+                if (hdrPending.ContainsKey(path) || oledOff.Contains(path)) continue;
+                var m = mons.FirstOrDefault(x => x.DevicePath == path);
+                var now = m != null ? DisplayModes.Current(m.GdiName) : null;
+                var want = kv.Value;
+                if (now == null || SameMode(now, want) || !ModeGuard.Ready(path)) continue;
+                DisplayMode last;
+                bool ours = modeLastSet.TryGetValue(path, out last) && SameMode(now, last); // a live edit from our own last mode
+                bool reverted = SameMode(now, OwnOf(modeOwn, m));                            // its own mode: HDR switched, or not yet changed
+                if (!ours && !reverted)
+                {
+                    Log.Write(m.Name + " was set to " + DisplayMode.Describe(now.Width, now.Height, now.Hz) + " outside HDR Ultimate; leaving it");
+                    modeWanted.Remove(path);
+                    continue;
+                }
+                if (reverted && last != null && TooManyReapplies(path))
+                {
+                    Log.Write("Windows keeps putting " + m.Name + " back to its own mode; leaving it there");
+                    Notify("Windows keeps resetting " + m.Name + "'s display mode, so HDR Ultimate stopped switching it for this game", 7000);
+                    modeWanted.Remove(path);
+                    continue;
+                }
+                if (reverted && last != null)
+                    Log.Write("Windows put " + m.Name + " back to " + DisplayMode.Describe(now.Width, now.Height, now.Hz) + "; switching it back");
+                var result = DisplayModes.Set(m, want.Width, want.Height, want.Hz);
+                if (result == ModeResult.Changed) modeLastSet[path] = want;
+                else if (result == ModeResult.Failed) modeWanted.Remove(path); // don't keep trying
+            }
+        }
+
+        // More than 3 switch-backs within a minute means something keeps resetting the monitor: stop.
+        bool TooManyReapplies(string path)
+        {
+            List<DateTime> times;
+            if (!reapplies.TryGetValue(path, out times)) reapplies[path] = times = new List<DateTime>();
+            var now = DateTime.UtcNow;
+            times.RemoveAll(t => now - t > TimeSpan.FromMinutes(1));
+            times.Add(now);
+            return times.Count > 3;
+        }
+
+        // For the HDR banner: the resolution and refresh rate the game uses on this monitor, or null if it doesn't set them.
+        // The mode it's switching to, which may still be waiting for the monitor to settle after HDR turned on.
+        string ModeLine(Game g, MonitorInfo m)
+        {
+            if (g == null || !g.HasMode || g.ModeMonitor != m.DevicePath) return null;
+            DisplayMode mode;
+            if (!modeWanted.TryGetValue(m.DevicePath, out mode)) mode = DisplayModes.Current(m.GdiName);
+            if (g.ModeInGame && g.ModeWidth > 0)
+                return g.ModeWidth + " × " + g.ModeHeight + " in game" + (mode != null && mode.Hz > 0 ? "  ·  " + mode.Hz + " Hz" : "");
+            return mode != null ? DisplayMode.Describe(mode.Width, mode.Height, mode.Hz).Replace(" @ ", "  ·  ") : null;
+        }
+
+        // Puts each monitor back in its own mode once no running game holds it. Returns the monitors restored (or about
+        // to be: a switch that would land right after another change waits for the next poll, RestorePending).
         List<string> RestoreModes(string exePath, List<MonitorInfo> mons)
         {
             var restored = new List<string>();
@@ -1276,10 +1922,94 @@ namespace HdrUltimate
                 var holders = modeSet[path];
                 if (exePath != null && (!holders.Remove(exePath) || holders.Count > 0)) continue;
                 modeSet.Remove(path);
+                modeWanted.Remove(path);
+                modeLastSet.Remove(path);
+                reapplies.Remove(path);
                 var m = mons.FirstOrDefault(x => x.DevicePath == path);
-                if (m != null && DisplayModes.Reset(m)) restored.Add(m.Name);
+                if (m == null) { modeOwn.Remove(path); continue; }
+                restored.Add(m.Name);
+                restoreWaiting.Add(path);
             }
+            RestorePending();
             return restored;
+        }
+
+        // The mode each monitor had before a game changed it. Recorded here rather than read from Windows: its saved
+        // display settings are kept per output name, and after a restart can belong to another monitor (seen here:
+        // the X27U's saved mode was the portrait monitor's 1440 × 2560 @ 60 Hz). Putting that on would be a disaster.
+        static DisplayMode OwnOf(Dictionary<string, DisplayMode> own, MonitorInfo m)
+        {
+            DisplayMode mode;
+            return own.TryGetValue(m.DevicePath, out mode) ? mode : DisplayModes.Current(m.GdiName);
+        }
+
+        bool InOwnMode(MonitorInfo m) { return SameMode(DisplayModes.Current(m.GdiName), OwnOf(modeOwn, m)); }
+
+        // Switches a monitor back to its own mode, in one guarded change. True once it's there.
+        bool RestoreOwn(MonitorInfo m)
+        {
+            var own = OwnOf(modeOwn, m);
+            DisplayMode target;
+            var result = DisplayModes.Set(m, own.Width, own.Height, own.Hz, out target, true);
+            if (result == ModeResult.Changed) Log.Write("Restored display mode on " + m.Name);
+            return result == ModeResult.Changed || result == ModeResult.AlreadySet;
+        }
+
+        // From the poll timer (and RestoreModes): monitors waiting to go back to their own mode after their game.
+        void RestorePending()
+        {
+            if (restoreWaiting.Count == 0) return;
+            var mons = Hdr.GetMonitors();
+            foreach (var path in restoreWaiting.ToList())
+            {
+                var m = mons.FirstOrDefault(x => x.DevicePath == path);
+                if (modeSet.ContainsKey(path) || m == null) { restoreWaiting.Remove(path); continue; } // taken by another game, or gone
+                if (hdrPending.ContainsKey(path)) continue; // SwitchPendingHdr puts it back first
+                if (!InOwnMode(m) && (ModeGuard.Wait(path) > TimeSpan.Zero || !RestoreOwn(m))) continue;
+                restoreWaiting.Remove(path);
+                modeOwn.Remove(path);
+            }
+        }
+
+        // HDR only ever switches while the monitor is in its own mode (the one it had before any game changed it),
+        // and not right after another change. Turning HDR off while a game's resolution was active crashed the NVIDIA driver
+        // in testing: every screen black, ports cycling, audio gone, apps not drawn until a restart. So with a game's
+        // mode active, the monitor goes back to its own mode first, and HDR switches once it has settled.
+        // Returns true or false when HDR switched (or failed) now, or null when it's waiting; then done runs later.
+        bool? SwitchHdr(MonitorInfo m, bool on, Action<MonitorInfo, bool> done = null)
+        {
+            string path = m.DevicePath;
+            if (!hdrPending.ContainsKey(path) && ModeGuard.Wait(path) == TimeSpan.Zero && InOwnMode(m))
+                return Hdr.SetHdr(m, on);
+            hdrPending[path] = Tuple.Create(on, done);
+            Log.Write("HDR " + (on ? "on" : "off") + " on " + m.Name + " waits until it's settled in its own mode");
+            SwitchPendingHdr(); // puts the monitor back now if it can
+            return null;
+        }
+
+        // From the poll timer: the HDR switches that are waiting. Puts each monitor back in its own mode (one change),
+        // waits for it to settle, then switches HDR.
+        void SwitchPendingHdr()
+        {
+            if (hdrPending.Count == 0) return;
+            var mons = Hdr.GetMonitors();
+            foreach (var path in hdrPending.Keys.ToList())
+            {
+                var m = mons.FirstOrDefault(x => x.DevicePath == path);
+                if (m == null) { hdrPending.Remove(path); continue; }
+                if (!InOwnMode(m))
+                {
+                    if (ModeGuard.Wait(path) == TimeSpan.Zero) RestoreOwn(m);
+                    continue;
+                }
+                if (ModeGuard.Wait(path) > TimeSpan.Zero) continue;
+                var p = hdrPending[path];
+                hdrPending.Remove(path);
+                if (!modeSet.ContainsKey(path)) { restoreWaiting.Remove(path); modeOwn.Remove(path); } // back for good
+                bool ok = m.HdrOn == p.Item1 || Hdr.SetHdr(m, p.Item1);
+                if (p.Item2 != null) p.Item2(Hdr.GetMonitors().FirstOrDefault(x => x.DevicePath == path) ?? m, ok);
+                UpdateIndicator();
+            }
         }
 
         void EnableFor(Game g)
@@ -1290,18 +2020,18 @@ namespace HdrUltimate
                 HashSet<string> holders;
                 if (autoOn.TryGetValue(m.DevicePath, out holders)) { holders.Add(g.ExePath); continue; }
                 if (m.HdrOn) continue; // already on before the game started: leave it on afterwards too
-                if (Hdr.SetHdr(m, true))
-                {
-                    autoOn[m.DevicePath] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { g.ExePath };
-                    changed.Add(m);
-                }
+                var result = SwitchHdr(m, true, (mon, ok) => { if (ok) AnnounceHdrOn(new List<MonitorInfo> { mon }, g.Name, g); });
+                if (result == false) continue;
+                autoOn[m.DevicePath] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { g.ExePath };
+                if (result == true) changed.Add(m);
             }
-            AnnounceHdrOn(changed, g.Name);
+            AnnounceHdrOn(changed, g.Name, g);
             UpdateIndicator();
         }
 
         // Waits for the display to settle, re-reads the real state, and only then shows the banner.
-        void AnnounceHdrOn(List<MonitorInfo> monitors, string detail)
+        // With a game, the banner also shows the resolution and refresh rate it set on that monitor.
+        void AnnounceHdrOn(List<MonitorInfo> monitors, string detail, Game game = null)
         {
             if (monitors.Count == 0) return;
             var paths = new HashSet<string>(monitors.Select(m => m.DevicePath));
@@ -1309,9 +2039,10 @@ namespace HdrUltimate
             settle.Tick += (s, e) =>
             {
                 settle.Dispose();
+                KeepModes(); // turning HDR on may have put a game's display mode back, so the banner shows the right one
                 var now = Hdr.GetMonitors().Where(m => paths.Contains(m.DevicePath)).ToList();
                 foreach (var m in now.Where(m => m.HdrOn))
-                    if (cfg.ShowOsd) new HdrBanner(m, detail).Show();
+                    if (cfg.ShowOsd) new HdrBanner(m, detail, ModeLine(game, m)).Show();
                 var missed = now.Where(m => !m.HdrOn).Select(m => m.Name).ToList();
                 if (missed.Count > 0) Notify("HDR didn't turn on  ·  " + string.Join(", ", missed));
                 UpdateIndicator();
@@ -1322,13 +2053,15 @@ namespace HdrUltimate
         void GameStopped(Game g)
         {
             Log.Write("Game stopped: " + g.Name);
+            modeApplied.Remove(g.ExePath);
             GamePrompt prompt;
             if (prompts.TryGetValue(g.ExePath, out prompt)) { prompts.Remove(g.ExePath); prompt.Dismiss(); }
             var mons = Hdr.GetMonitors();
-            bool modeRestored = RestoreModes(g.ExePath, mons).Count > 0;
             // The game saved its own settings as it exited, so put the chosen resolution back for next time.
             // cfg.Games, because editing a running game replaces its object.
             GameConfig.ApplyResolution(cfg.Games.FirstOrDefault(x => string.Equals(x.ExePath, g.ExePath, StringComparison.OrdinalIgnoreCase)) ?? g);
+            // The display mode goes back first, then HDR turns off once the monitor has settled (see SwitchHdr).
+            bool modeRestored = RestoreModes(g.ExePath, mons).Count > 0;
             var changed = new List<string>();
             foreach (var path in autoOn.Keys.ToList())
             {
@@ -1336,8 +2069,11 @@ namespace HdrUltimate
                 if (!holders.Remove(g.ExePath) || holders.Count > 0) continue; // another HDR game still needs it
                 autoOn.Remove(path);
                 if (!g.Restore) continue;
-                var m = mons.FirstOrDefault(x => x.DevicePath == path);
-                if (m != null && m.HdrOn && Hdr.SetHdr(m, false)) changed.Add(m.Name);
+                var m = Hdr.GetMonitors().FirstOrDefault(x => x.DevicePath == path);
+                if (m == null || !m.HdrOn) continue;
+                string name = g.Name;
+                var result = SwitchHdr(m, false, (mon, ok) => { if (ok) Notify(name + " closed  ·  HDR OFF  ·  " + mon.Name); });
+                if (result == true) changed.Add(m.Name);
             }
             var parts = new List<string>();
             if (changed.Count > 0) parts.Add("HDR OFF  ·  " + string.Join(", ", changed));
@@ -1363,13 +2099,17 @@ namespace HdrUltimate
             foreach (var path in oledOff.ToList())
             {
                 if (running.Any(g => g.Monitors.ContainsKey(path)) && watched.Contains(path) && !focused(path)) continue;
+                if (hdrPending.ContainsKey(path)) continue; // still switching off
                 oledOff.Remove(path);
                 if (!running.Any(g => g.Monitors.ContainsKey(path))) continue; // game closed: nothing to come back to
                 var m = mons.FirstOrDefault(x => x.DevicePath == path);
-                if (m != null && !m.HdrOn && Hdr.SetHdr(m, true)) restored.Add(m);
+                if (m == null || m.HdrOn) continue;
+                var game = focusedGame;
+                if (SwitchHdr(m, true, (mon, ok) => { if (ok) AnnounceHdrOn(new List<MonitorInfo> { mon }, game != null ? game.Name : "", game); }) == true)
+                    restored.Add(m);
             }
             if (restored.Count > 0) Log.Write("OLED care restored HDR: " + string.Join(", ", restored.Select(m => m.Name)));
-            AnnounceHdrOn(restored, focusedGame != null ? focusedGame.Name : "");
+            AnnounceHdrOn(restored, focusedGame != null ? focusedGame.Name : "", focusedGame);
 
             var limit = TimeSpan.FromMinutes(cfg.OledMinutes);
             var now = DateTime.UtcNow;
@@ -1380,10 +2120,11 @@ namespace HdrUltimate
                 var m = mons.FirstOrDefault(x => x.DevicePath == path);
                 // The clock only runs while HDR is actually on, so turning it on by hand gets a full wait.
                 if (focused(path) || !lastFocused.ContainsKey(path) || m == null || !m.HdrOn) { lastFocused[path] = now; continue; }
-                if (now - lastFocused[path] < limit) continue;
-                if (!Hdr.SetHdr(m, false)) continue;
-                oledOff.Add(path);
-                turnedOff.Add(m.Name);
+                if (now - lastFocused[path] < limit || hdrPending.ContainsKey(path)) continue;
+                var result = SwitchHdr(m, false, (mon, ok) => { if (ok) Notify("OLED care  ·  HDR OFF  ·  " + mon.Name); });
+                if (result == false) continue;
+                oledOff.Add(path); // while tabbed out the monitor stays in its own mode (KeepModes waits)
+                if (result == true) turnedOff.Add(m.Name);
             }
             if (turnedOff.Count > 0)
             {
@@ -1403,18 +2144,29 @@ namespace HdrUltimate
             // Mixed state -> turn everything on; all on -> turn everything off.
             bool turnOn = targets.Any(m => !m.HdrOn);
             var failed = new List<string>();
+            var now = new List<MonitorInfo>();
+            Action<MonitorInfo, bool> later = (mon, ok) =>
+            {
+                if (!ok) Notify("Could not change HDR on " + mon.Name);
+                else if (turnOn) AnnounceHdrOn(new List<MonitorInfo> { mon }, "");
+                else Notify("HDR OFF  ·  " + mon.Name);
+            };
             foreach (var m in targets)
-                if (!Hdr.SetHdr(m, turnOn)) failed.Add(m.Name);
+            {
+                var result = SwitchHdr(m, turnOn, later); // with a game's mode active, a moment later (see SwitchHdr)
+                if (result == false) failed.Add(m.Name);
+                else if (result == true) now.Add(m);
+            }
 
             if (turnOn)
             {
-                AnnounceHdrOn(targets.Where(m => !failed.Contains(m.Name)).ToList(), "");
+                AnnounceHdrOn(now, "");
                 if (failed.Count > 0) Notify("Failed: " + string.Join(", ", failed));
             }
-            else
+            else if (now.Count > 0 || failed.Count > 0)
             {
-                string msg = "HDR OFF  ·  " + string.Join(", ", targets.Select(m => m.Name));
-                if (failed.Count > 0) msg += "\nFailed: " + string.Join(", ", failed);
+                string msg = now.Count > 0 ? "HDR OFF  ·  " + string.Join(", ", now.Select(m => m.Name)) : "";
+                if (failed.Count > 0) msg += (msg != "" ? "\n" : "") + "Failed: " + string.Join(", ", failed);
                 Notify(msg);
             }
             UpdateIndicator();
@@ -1422,9 +2174,15 @@ namespace HdrUltimate
 
         void ToggleOne(MonitorInfo m)
         {
-            if (!Hdr.SetHdr(m, !m.HdrOn)) Notify("Could not change HDR on " + m.Name);
-            else if (m.HdrOn) Notify("HDR OFF  ·  " + m.Name);
-            else AnnounceHdrOn(new List<MonitorInfo> { m }, "");
+            bool on = !m.HdrOn;
+            Action<MonitorInfo, bool> show = (mon, ok) =>
+            {
+                if (!ok) Notify("Could not change HDR on " + mon.Name);
+                else if (!on) Notify("HDR OFF  ·  " + mon.Name);
+                else AnnounceHdrOn(new List<MonitorInfo> { mon }, "");
+            };
+            var result = SwitchHdr(m, on, show);
+            if (result.HasValue) show(m, result.Value);
             UpdateIndicator();
         }
 
@@ -1448,6 +2206,13 @@ namespace HdrUltimate
             menu.Items.Add(new ToolStripSeparator());
             foreach (var g in runningGames.Values)
                 menu.Items.Add(new ToolStripMenuItem("Detected: " + g.Name) { Enabled = false });
+            if (Updates.Latest != null)
+            {
+                var update = new ToolStripMenuItem("Update available: " + Updates.Latest);
+                update.Font = new Font(update.Font, FontStyle.Bold);
+                update.Click += (s, e) => Updates.Open();
+                menu.Items.Add(update);
+            }
             menu.Items.Add("Settings", null, (s, e) => OpenSettings());
             menu.Items.Add("Exit", null, (s, e) => ExitThread());
         }
@@ -1465,7 +2230,14 @@ namespace HdrUltimate
         protected override void ExitThreadCore()
         {
             poll.Dispose();
-            if (modeSet.Count > 0) RestoreModes(null, Hdr.GetMonitors()); // don't leave a game's display mode behind
+            exitSignal.Dispose();
+            if (modeSet.Count > 0 || restoreWaiting.Count > 0) // don't leave a game's display mode behind
+            {
+                hdrPending.Clear(); // HDR stays as it is; only the mode goes back
+                var wait = modeSet.Keys.Concat(restoreWaiting).Select(ModeGuard.Wait).DefaultIfEmpty(TimeSpan.Zero).Max();
+                if (wait > TimeSpan.Zero) Thread.Sleep(wait); // the app is closing, so wait out the settle time here
+                RestoreModes(null, Hdr.GetMonitors());
+            }
             tray.Visible = false;
             tray.Dispose();
             hotkeys.Dispose();
@@ -2139,6 +2911,32 @@ namespace HdrUltimate
             return task;
         }
 
+        // The exe that starts with Windows now, or null. Read before RefreshPath points it at this exe.
+        public static string RegisteredPath()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
+                {
+                    var value = k == null ? null : k.GetValue(Name) as string;
+                    if (!string.IsNullOrEmpty(value)) return value.Trim().Trim('"');
+                }
+                string xml;
+                if (Schtasks("/query /tn \"" + TaskName + "\" /xml", out xml) == 0)
+                {
+                    var m = Regex.Match(xml, "<Command>([^<]+)</Command>");
+                    if (m.Success) return XmlDecode(m.Groups[1].Value.Trim().Trim('"'));
+                }
+            }
+            catch (Exception ex) { Log.Write("Couldn't read the startup entry: " + ex.Message); }
+            return null;
+        }
+
+        static string XmlDecode(string s)
+        {
+            return s.Replace("&quot;", "\"").Replace("&apos;", "'").Replace("&lt;", "<").Replace("&gt;", ">").Replace("&amp;", "&");
+        }
+
         // Runs at launch. Only updates what the user already turned on, for when the exe has moved.
         public static void RefreshPath()
         {
@@ -2255,7 +3053,7 @@ namespace HdrUltimate
 
         static Icon ForState(List<bool> states, int size)
         {
-            string key = Theme.Current.Bg.ToArgb() + ":" + size + ":" + string.Join("", states.Select(b => b ? "1" : "0"));
+            string key = Letter + Theme.Current.Bg.ToArgb() + ":" + size + ":" + string.Join("", states.Select(b => b ? "1" : "0"));
             Icon cached;
             if (cache.TryGetValue(key, out cached)) return cached;
             using (var bmp = Render(size, states))
@@ -2266,7 +3064,11 @@ namespace HdrUltimate
             }
         }
 
-        // A rainbow "H" and outline on a white (light) or black (dark) tile.
+        // Dev builds get a "D", so they're easy to tell apart from the real app in the tray, taskbar and Explorer.
+        // The dev game sets "G".
+        public static string Letter = Build.Dev ? "D" : "H";
+
+        // A rainbow "H" (or the dev "D") and outline on a white (light) or black (dark) tile.
         // When every monitor has HDR off, the letter and outline go grey.
         // The bottom segments show each HDR-capable monitor (lit = HDR on), left to right in display order.
         public static Bitmap Render(int size, List<bool> states)
@@ -2301,7 +3103,7 @@ namespace HdrUltimate
                 using (var fit = new Matrix())
                 {
                     var style = HeaderFont.Family.IsStyleAvailable(FontStyle.Bold) ? FontStyle.Bold : FontStyle.Regular;
-                    letters.AddString("H", HeaderFont.Family, (int)style, 100f, Point.Empty, StringFormat.GenericTypographic);
+                    letters.AddString(Letter, HeaderFont.Family, (int)style, 100f, Point.Empty, StringFormat.GenericTypographic);
                     var b = letters.GetBounds();
                     float scale = Math.Min(area.Width / b.Width, area.Height / b.Height);
                     fit.Translate(area.X + area.Width / 2, area.Y + area.Height / 2);
@@ -2358,7 +3160,7 @@ namespace HdrUltimate
     {
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 3000 };
 
-        public HdrBanner(MonitorInfo m, string detail)
+        public HdrBanner(MonitorInfo m, string detail, string mode = null)
         {
             var p = Theme.Current;
             Text = "HDR Ultimate banner";
@@ -2371,7 +3173,16 @@ namespace HdrUltimate
             var title = new HeaderLabel { Text = "HDR ON", Font = HeaderFont.Get(12f), ForeColor = p.Text, Location = new Point(68, 10), Size = new Size(200, 24) };
             var body = new Label { Text = line, AutoSize = true, ForeColor = p.Muted, Location = new Point(66, 36) };
             Controls.AddRange(new Control[] { logo, title, body });
-            ClientSize = new Size(Math.Max(250, body.PreferredWidth + 86), 66);
+            int width = body.PreferredWidth, height = 66;
+            if (!string.IsNullOrEmpty(mode)) // the game's resolution and refresh rate, on a line of its own
+            {
+                var modeLabel = new Label { Text = mode, AutoSize = true, ForeColor = p.Text, Location = new Point(66, 58) };
+                Controls.Add(modeLabel);
+                width = Math.Max(width, modeLabel.PreferredWidth);
+                height = 88;
+                logo.Top = 25;
+            }
+            ClientSize = new Size(Math.Max(250, width + 86), height);
             var screen = Screen.AllScreens.FirstOrDefault(s => s.DeviceName == m.GdiName) ?? Screen.PrimaryScreen;
             Location = new Point(screen.WorkingArea.Right - Width - 16, screen.WorkingArea.Top + 16);
             Paint += (s, e) =>
@@ -2527,8 +3338,8 @@ namespace HdrUltimate
             list = NewList(new[] { "Hotkey", "Monitors", "Status" }, new[] { 190, 320, 170 });
             list.MouseDoubleClick += (s, e) => HotkeyMenu(e.Location);
             gameList = Build.InGameHdrColumn // dev-only until the design is settled
-                ? NewList(new[] { "Game", "Exe", "Monitors", "In-game HDR", "On launch" }, new[] { 190, 165, 95, 130, 100 })
-                : NewList(new[] { "Game", "Exe", "Monitors", "On launch" }, new[] { 220, 190, 140, 130 });
+                ? NewList(new[] { "Game", "Exe", "Monitors", "In-game HDR", "Display mode", "On launch" }, new[] { 135, 105, 85, 100, 165, 90 })
+                : NewList(new[] { "Game", "Exe", "Monitors", "Display mode", "On launch" }, new[] { 180, 140, 120, 150, 90 });
             gameList.MouseDoubleClick += (s, e) => CellMenu(e.Location);
 
             var tabs = new Tabs { Dock = DockStyle.Fill };
@@ -2624,6 +3435,14 @@ namespace HdrUltimate
             };
             if (Usage.Offered)
                 rows.Add(Line("Anonymous active user count", Switch(cfg.UsageEnabled, v => { cfg.UsageEnabled = v; cfg.Save(); })));
+            if (Updates.Offered)
+            {
+                rows.Add(Line("Check for updates", Switch(cfg.UpdatesEnabled, v => { cfg.UpdatesEnabled = v; cfg.Save(); })));
+                var get = Btn(Updates.Latest != null ? "Download" : "Releases", Updates.Open, Updates.Latest != null);
+                get.AutoSize = false;
+                get.Width = 120;
+                rows.Add(Line("Version " + Build.Version + (Updates.Latest != null ? "  ·  " + Updates.Latest + " is available" : ""), get));
+            }
             if (!Build.Release)
             {
                 var logs = Btn("Open folder", () => Process.Start("explorer.exe", "\"" + Config.Dir + "\""));
@@ -2684,13 +3503,36 @@ namespace HdrUltimate
                 b.Margin = new Padding(0, 0, 10, 10);
                 page.Controls.Add(b);
             };
+            // A real (stand-in) game: it goes in the HDR games list, where its resolution and refresh rate can be set.
+            add("Launch dev game", () =>
+            {
+                int count = cfg.Games.Count;
+                DevGame.Launch(cfg); // puts it back in the list if it was removed
+                if (cfg.Games.Count != count) { failed = apply(); Refill(); }
+            });
+            add("Close dev game", DevGame.CloseAll);
             add("HDR banner", () => new HdrBanner(first(), "").Show());
             add("HDR banner: game", () => new HdrBanner(first(), testGame.Name).Show());
+            add("HDR banner: game with display mode", () => new HdrBanner(first(), testGame.Name, "2560 × 1440  ·  165 Hz").Show());
             add("HDR banner: all monitors", () => { foreach (var m in Hdr.GetMonitors()) new HdrBanner(m, "").Show(); });
             add("HDR off notice", () => Osd.Flash("HDR OFF  ·  " + firstName()));
             add("HDR failed notice", () => Osd.Flash("HDR didn't turn on  ·  " + firstName()));
             add("Game closed notice", () => Osd.Flash(testGame.Name + " closed  ·  HDR OFF  ·  " + firstName()));
             add("In-game HDR off notice", () => Osd.Flash(testGame.Name + ": HDR is off in the game's settings  ·  Windows HDR left off", 7000));
+            // Display mode notices.
+            add("Display mode notice", () => Osd.Flash(testGame.Name + "  ·  2560 × 1440 @ 165 Hz  ·  " + firstName()));
+            add("Display mode failed notice", () => Osd.Flash(testGame.Name + "  ·  couldn't switch " + firstName() + " to 2560 × 1440 @ 480 Hz", 7000));
+            add("Display mode restored notice", () => Osd.Flash(testGame.Name + " closed  ·  HDR OFF  ·  " + firstName() + "  ·  display mode restored"));
+            // Updates.
+            add("Update notice", () => { cfg.UpdateNotified = ""; Updates.Pretend(); }); // also adds the tray menu item and Settings row
+            add("Updated notice", () =>
+            {
+                if (TrayApp.DevBalloon != null)
+                    TrayApp.DevBalloon("Updated to " + Build.Version, "The old version (1.2.0) was moved to the Recycle Bin.");
+            });
+            add("Old version prompt", () => Log.Write("Old version prompt answered: " + MessageBox.Show(this,
+                Build.Name + " 1.2.0 is still running.\n\nClose it and switch to " + Build.Version + "?", Build.Name,
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question)));
             add("OLED care notice", () => Osd.Flash("OLED care  ·  HDR OFF  ·  " + firstName()));
             add("Game prompt: HDR on", () => ShowGamePrompt(testGame, firstName(), true));
             add("Game prompt: unknown", () => ShowGamePrompt(testGame, firstName(), null));
@@ -2721,6 +3563,7 @@ namespace HdrUltimate
                     var state = item.SubItems.Add(inGame == true ? "On" : inGame == false ? "Off" : "—");
                     if (inGame == true) state.Tag = "accent";
                 }
+                item.SubItems.Add(ModeSummary(g));
                 item.SubItems.Add(g.Ask ? "Ask" : "Automatic");
                 item.ToolTipText = g.ExePath;
                 if (!File.Exists(g.ExePath)) item.ForeColor = Color.Gray;
@@ -2740,6 +3583,17 @@ namespace HdrUltimate
                 if (bad) item.ForeColor = Color.Firebrick;
                 list.Items.Add(item);
             }
+        }
+
+        // Short, to fit the column: "2560×1440 165Hz", "1920×1080 in-game".
+        static string ModeSummary(Game g)
+        {
+            if (!g.HasMode) return "Don't change";
+            var parts = new List<string>();
+            if (g.ModeWidth > 0) parts.Add(g.ModeWidth + "×" + g.ModeHeight);
+            if (g.ModeHz > 0) parts.Add(g.ModeHz + "Hz");
+            if (g.ModeInGame) parts.Add("in-game");
+            return string.Join(" ", parts);
         }
 
         void RunDialog(int index)
@@ -2833,6 +3687,9 @@ namespace HdrUltimate
                 Refill();
                 if (row < gameList.Items.Count) gameList.Items[row].Selected = true;
             };
+
+            // Resolution and refresh rate need several pickers, so that column opens the game's full settings.
+            if (gameList.Columns[col].Text == "Display mode") { RunGameDialog(row, null); return null; }
 
             DropdownBase box;
             Action onClosed = null;
@@ -3167,16 +4024,27 @@ namespace HdrUltimate
             FillRates(hz);
         }
 
-        // The rates for the chosen resolution, or for the current one when it isn't changing.
+        // The rates for the chosen resolution, or for the current one when it isn't changing, plus the common rates
+        // up to 480 Hz. One the monitor doesn't offer falls back to the fastest it does offer below it, and says so.
         void FillRates(int hz)
         {
             var size = resolution.Selected > 0 ? sizes[resolution.Selected - 1] : current;
-            rates = modes.Where(x => x.Hz > 0 && (size == null || size.Width == 0 || (x.Width == size.Width && x.Height == size.Height)))
-                         .Select(x => x.Hz).Distinct().OrderByDescending(x => x).ToList();
+            var offered = modes.Where(x => x.Hz > 0 && (size == null || size.Width == 0 || (x.Width == size.Width && x.Height == size.Height)))
+                               .Select(x => x.Hz).Distinct().ToList();
+            rates = offered.Count == 0 ? new List<int>() // monitor not connected: just what was saved
+                : offered.Concat(DisplayModes.CommonRates.Where(r => DisplayModes.Fallback(offered, r) > 0)).Distinct().OrderByDescending(x => x).ToList();
+            if (hz > 0 && !rates.Contains(hz)) rates = rates.Concat(new[] { hz }).OrderByDescending(x => x).ToList(); // keep the saved choice
             bool sameSize = current != null && size != null && size.Width == current.Width && size.Height == current.Height;
             refresh.Options = new[] { "Don't change" }.Concat(rates.Select(r =>
-                r + " Hz" + (sameSize && r == current.Hz ? "  (current)" : ""))).ToArray();
+                r + " Hz" + (offered.Count > 0 && !offered.Contains(r) ? FallbackNote(offered, r)
+                             : sameSize && r == current.Hz ? "  (current)" : ""))).ToArray();
             refresh.Selected = rates.IndexOf(hz) + 1;
+        }
+
+        static string FallbackNote(List<int> offered, int hz)
+        {
+            int lower = DisplayModes.Fallback(offered, hz);
+            return lower > 0 ? "  (uses " + lower + " Hz here)" : "  (not offered here)";
         }
 
         DisplayMode SelectedSize() { return resolution.Selected > 0 ? sizes[resolution.Selected - 1] : new DisplayMode(); }
