@@ -19,6 +19,10 @@ sh install.sh
 
 Remove it with `sh install.sh --uninstall`.
 
+## Updating
+
+HDR Ultimate tells you when a new version is out (you can turn this off under Settings > General). Download it and run `sh install.sh` again: it replaces the installed copy, and the next launch closes the old version if it's still running.
+
 ## Differences from Windows
 
 - **Hotkeys:** Wayland doesn't let apps grab keys. Copy a command from Settings > Monitor hotkeys and add it as a custom shortcut in your desktop's keyboard settings.

@@ -14,17 +14,18 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 import traceback
 import urllib.request
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.4"
 OLED_MIN_MINUTES, OLED_MAX_MINUTES = 1, 30
 ICON_NAME = "hdr-ultimate"
 
@@ -108,6 +109,8 @@ class Config:
     usage_enabled: bool = True  # daily check-in for the active user count; opt-out offered on first run
     usage_asked: bool = False
     usage_day: str = ""         # UTC date of the last check-in
+    updates_enabled: bool = True  # look for new releases on GitHub
+    update_notified: str = ""   # newest version already announced, so each release is announced once
     games: list = field(default_factory=list)
 
     @staticmethod
@@ -182,9 +185,125 @@ class Usage:
         self.sending = False
 
 
+def parse_version(text):
+    """Release tags V1.2, 1.2 and 1.2.0 all become (1, 2, 0); anything else is None."""
+    m = re.fullmatch(r"[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?", (text or "").strip())
+    return tuple(int(part or 0) for part in m.groups()) if m else None
+
+
+def is_newer(candidate, current):
+    a, b = parse_version(candidate), parse_version(current)
+    return a is not None and b is not None and a > b
+
+
+class Updates:
+    """Looks up the latest GitHub release every few hours and reports it when it's newer than this version."""
+    API = "https://api.github.com/repos/WillPidgeon/HDR-Ultimate/releases/latest"
+    RELEASES_PAGE = "https://github.com/WillPidgeon/HDR-Ultimate/releases/latest"
+    PAGE = re.compile(r"https://github\.com/WillPidgeon/HDR-Ultimate/releases/[^\s\"]+")
+    TEST_VARIABLE = "HDRULTIMATE_UPDATE_TEST_URL"  # test builds only check a test server named here
+
+    def __init__(self):
+        self.next_try = time.monotonic() + 15  # a moment after launch, not while everything is starting
+        self.checking = False
+        self.latest = self.page = None
+        self.found = None  # (version, page), handed over from the checking thread
+
+    @classmethod
+    def url(cls):
+        return cls.API if Build.channel == "release" else os.environ.get(cls.TEST_VARIABLE, "")
+
+    @classmethod
+    def offered(cls):
+        return bool(cls.url())
+
+    def tick(self, config):
+        """From the poll timer. Returns True when a newer release has just turned up."""
+        if self.found:
+            (version, page), self.found = self.found, None
+            if version != self.latest:
+                self.latest, self.page = version, page
+                log("Update available: " + version)
+                return True
+        if not self.url() or not config.updates_enabled or self.checking or time.monotonic() < self.next_try:
+            return False
+        self.checking = True
+        threading.Thread(target=self.check, args=(self.url(),), daemon=True).start()
+        return False
+
+    def check(self, url):
+        ok = False
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "HDRUltimate", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(request, timeout=15) as reply:
+                data = json.loads(reply.read().decode("utf-8"))
+            tag = data.get("tag_name") if isinstance(data, dict) else None
+            if parse_version(tag):
+                ok = True
+                page = data.get("html_url")
+                if not (isinstance(page, str) and self.PAGE.fullmatch(page)):
+                    page = self.RELEASES_PAGE  # only ever a link to this project's releases
+                if is_newer(tag, VERSION):
+                    self.found = ("%d.%d.%d" % parse_version(tag), page)
+        except (OSError, ValueError) as ex:
+            log("Update check failed: " + str(ex))
+        self.next_try = time.monotonic() + (6 * 3600 if ok else 30 * 60)
+        self.checking = False
+
+    def open(self):
+        subprocess.Popen(["xdg-open", self.page or self.RELEASES_PAGE])
+
+
+def stop_old_copies():
+    """Stops other running copies of this channel (versions before 1.3.0 can't be asked to quit). Returns how many."""
+    me, uid = os.getpid(), os.getuid()
+    want = {"dev": {"--dev"}, "playtest": {"--playtest"}}.get(Build.channel, set())
+    stopped = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            argv = [a.decode(errors="replace") for a in (entry / "cmdline").read_bytes().split(b"\0") if a]
+        except OSError:
+            continue
+        if not any(file_name(a) == "hdr_ultimate.py" for a in argv):
+            continue
+        if any(a.split("=")[0] in ("--toggle", "--list", "--make-icon", "--screenshot") for a in argv):
+            continue  # a one-off command, not the app
+        if {"--dev", "--playtest"} & set(argv) != want:
+            continue
+        try:
+            os.kill(int(entry.name), signal.SIGTERM)
+            stopped.append(entry)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 3
+    while stopped and time.monotonic() < deadline and any(p.exists() for p in stopped):
+        time.sleep(0.1)
+    if stopped:
+        log("Stopped %d older copy/copies" % len(stopped))
+    return len(stopped)
+
+
 def file_name(path):
     """Last path part, for both Unix paths and the Windows paths Proton uses."""
     return re.split(r"[\\/]", path or "")[-1]
+
+
+def mode_summary(game):
+    """Short text for the games list, e.g. 2560×1440 165Hz or 1920×1080 in-game."""
+    if not game.has_mode:
+        return "Don't change"
+    parts = []
+    if game.mode_width > 0:
+        parts.append("%d×%d" % (game.mode_width, game.mode_height))
+    if game.mode_hz > 0:
+        parts.append("%dHz" % game.mode_hz)
+    if game.mode_in_game:
+        parts.append("in-game")
+    return " ".join(parts)
 
 
 def game_name_for(exe):
@@ -209,19 +328,84 @@ def sort_modes(modes):
     return sorted(set(modes), key=lambda m: (m[0] * m[1], m[0], m[2]), reverse=True)
 
 
+COMMON_RATES = (480, 390, 360, 300, 280, 240, 200, 180, 175, 165, 144, 120, 100, 75, 60)  # offered on every monitor
+
+
+def fallback_rate(offered, hz):
+    """The rate to use for a chosen one: itself if offered, else the fastest offered below it (0 = none)."""
+    return max((r for r in offered if r <= hz), default=0)
+
+
 def pick_mode(monitor, width, height, hz):
     """The mode to switch to; zero keeps that part. A new resolution keeps the current refresh rate if it has it,
-    otherwise its fastest. None if the monitor doesn't offer it."""
+    otherwise its fastest. A rate the monitor doesn't offer becomes the fastest it offers below that.
+    None if the monitor doesn't offer it."""
     if not monitor.current:
         return None
     w, h = (width, height) if width > 0 else monitor.current[:2]
     rates = [m[2] for m in monitor.modes if m[:2] == (w, h)]
-    rate = hz if hz > 0 else monitor.current[2] if monitor.current[2] in rates else max(rates, default=0)
+    rate = fallback_rate(rates, hz) if hz > 0 else monitor.current[2] if monitor.current[2] in rates else max(rates, default=0)
+    if hz > 0 and 0 < rate != hz:
+        log("%s doesn't offer %d Hz at %d × %d, so using %d Hz" % (monitor.name, hz, w, h, rate))
     return (w, h, rate) if rate in rates else None
 
 
 def describe_mode(width, height, hz):
     return " @ ".join(p for p in ("%d × %d" % (width, height) if width > 0 else "", "%d Hz" % hz if hz > 0 else "") if p)
+
+
+class ModeGuard:
+    """Keeps display changes from piling up. In testing on Windows, two changes in a row on one monitor stalled the
+    graphics driver for 30 seconds and blacked out every screen, so on every desktop: one change per monitor every few
+    seconds (HDR switches count), a short gap between changes on any monitors, and a monitor where a change is slow or
+    fails twice gets no more mode changes this session. HDR control keeps working."""
+    MONITOR_GAP, ANY_GAP, SLOW = 4.0, 1.5, 5.0
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.last, self.failures, self.blocked = {}, {}, set()
+        self.last_any = float("-inf")
+
+    def wait(self, mon):
+        """Seconds until this monitor may change again (0 = now)."""
+        now = self.clock()
+        return max(0.0, self.last.get(mon, float("-inf")) + self.MONITOR_GAP - now, self.last_any + self.ANY_GAP - now)
+
+    def ready(self, mon):
+        return mon not in self.blocked and self.wait(mon) == 0
+
+    def touched(self, mon):
+        """Something changed this monitor's output: a mode change, or HDR switching."""
+        self.last[mon] = self.last_any = self.clock()
+
+    def result(self, mon, ok, took):
+        """Records a mode change. Returns True when it has just switched mode changes off for this monitor."""
+        self.touched(mon)
+        if ok and took < self.SLOW:
+            self.failures.pop(mon, None)
+            return False
+        self.failures[mon] = n = self.failures.get(mon, 0) + 1
+        if (took < self.SLOW and n < 2) or mon in self.blocked:
+            return False
+        self.blocked.add(mon)
+        log("Display mode changes on %s are off for this session: %s" % (mon, "a change took %.1f s" % took if ok else "two changes failed"))
+        return True
+
+
+def running_mode_setting(game):
+    """The part of a game's display mode setting that applies while it runs (in-game resolution waits for it to close)."""
+    width, height = game.desktop_size
+    return (game.mode_monitor, width, height, game.mode_hz) if game.has_mode and (width > 0 or game.mode_hz > 0) else ()
+
+
+def banner_mode_line(game, monitor):
+    """For the HDR banner: the resolution and refresh rate the game uses on this monitor, or None if it doesn't set them."""
+    if game is None or not game.has_mode or game.mode_monitor != monitor.id:
+        return None
+    hz = monitor.current[2] if monitor.current else 0
+    if game.mode_in_game and game.mode_width > 0:
+        return "%d × %d in game%s" % (game.mode_width, game.mode_height, "  ·  %d Hz" % hz if hz else "")
+    return describe_mode(*monitor.current).replace(" @ ", "  ·  ") if monitor.current else None
 
 
 def edid_name(connector):
@@ -821,14 +1005,33 @@ def run_ui(args):
 
     socket_name = "hdr-ultimate" + Build.suffix()
 
-    # Second launch: hand over to the running app.
+    def send(sock, text):
+        sock.write(text.encode())
+        sock.waitForBytesWritten(500)
+
+    # Second launch: hand over to the running app, unless it's an older version, which this one replaces.
+    replaced = False
     probe = QLocalSocket()
     probe.connectToServer(socket_name)
     if probe.waitForConnected(300):
-        probe.write(((args.toggle and "toggle " + args.toggle) or "show").encode())
-        probe.waitForBytesWritten(500)
-        probe.disconnectFromServer()
-        return 0
+        if args.toggle:
+            send(probe, "toggle " + args.toggle)
+            probe.disconnectFromServer()
+            return 0
+        send(probe, "hello " + VERSION)
+        reply = bytes(probe.readAll()).decode(errors="replace") if probe.waitForReadyRead(1500) else ""
+        if reply.startswith("version ") and not is_newer(VERSION, reply[8:]):
+            send(probe, "show")  # this version or newer is already running
+            probe.disconnectFromServer()
+            return 0
+        if reply.startswith("version "):
+            log("Replacing running version " + reply[8:])
+            send(probe, "quit")
+            probe.waitForDisconnected(3000)
+        else:
+            probe.disconnectFromServer()
+            stop_old_copies()  # before 1.3.0, which doesn't answer
+        replaced = True
 
     app = QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)
@@ -923,7 +1126,7 @@ def run_ui(args):
     theme.apply()
 
     def render_logo(size, states):
-        """A rainbow H and outline on a white or black tile, with a bar per HDR monitor. Grey when all are off."""
+        """A rainbow H (D for dev) and outline on a white or black tile, with a bar per HDR monitor. Grey when all are off."""
         p = theme.p
         pix = QPixmap(size, size)
         pix.fill(Qt.GlobalColor.transparent)
@@ -943,7 +1146,7 @@ def run_ui(args):
         gap = max(1, size // 16) if states else 0
         area = QRectF(pad, pad, size - 2 * pad, size - 2 * pad - bar - gap)
         path = QPainterPath()
-        path.addText(0, 0, header_font(72), "H")
+        path.addText(0, 0, header_font(72), "D" if Build.dev() else "H")  # dev builds get a D, to tell them apart
         b = path.boundingRect()
         scale = min(area.width() / b.width(), area.height() / b.height())
         g.translate(area.center())
@@ -1058,7 +1261,7 @@ def run_ui(args):
         lay.addWidget(QLabel(text))
         w.present()
 
-    def show_banner(monitor_name, detail):
+    def show_banner(monitor_name, detail, mode=None):
         w = Popup(3000)
         lay = QHBoxLayout(w)
         lay.setContentsMargins(14, 10, 22, 10)
@@ -1068,6 +1271,8 @@ def run_ui(args):
         text = QVBoxLayout()
         text.addWidget(heading("HDR ON", 13))
         text.addWidget(muted(monitor_name + ("  ·  " + detail if detail else "")))
+        if mode:  # the game's resolution and refresh rate, on a line of its own
+            text.addWidget(QLabel(mode))
         lay.addLayout(text)
         w.present()
 
@@ -1226,13 +1431,23 @@ def run_ui(args):
             self.fill_rates(hz)
 
         def fill_rates(self, hz):
-            """The rates for the chosen resolution, or for the current one when it isn't changing."""
+            """The rates for the chosen resolution, or for the current one when it isn't changing, plus the common rates
+            up to 480 Hz. One the monitor doesn't offer falls back to the fastest it does offer below it, and says so."""
             size = self.sizes[self.resolution.currentIndex() - 1] if self.resolution.currentIndex() > 0 else \
                 (self.current[:2] if self.current else None)
-            self.rates = sorted({m[2] for m in self.modes if m[2] > 0 and (size is None or m[:2] == size)}, reverse=True)
+            offered = {m[2] for m in self.modes if m[2] > 0 and (size is None or m[:2] == size)}
+            extra = {r for r in COMMON_RATES if fallback_rate(offered, r)} if offered else set()
+            self.rates = sorted(offered | extra | ({hz} if hz > 0 else set()), reverse=True)  # keeps the saved choice
             same = self.current is not None and size == self.current[:2]
+
+            def label(r):
+                if offered and r not in offered:
+                    lower = fallback_rate(offered, r)
+                    return "%d Hz  (%s)" % (r, "uses %d Hz here" % lower if lower else "not offered here")
+                return "%d Hz" % r + ("  (current)" if same and r == self.current[2] else "")
+
             self.refresh.clear()
-            self.refresh.addItems(["Don't change"] + ["%d Hz" % r + ("  (current)" if same and r == self.current[2] else "") for r in self.rates])
+            self.refresh.addItems(["Don't change"] + [label(r) for r in self.rates])
             self.refresh.setCurrentIndex(self.rates.index(hz) + 1 if hz in self.rates else 0)
 
         def selected_size(self):
@@ -1301,7 +1516,7 @@ def run_ui(args):
             theme.changed.connect(self.repaint_logo)
             self.repaint_logo()
 
-            self.columns = ["Game", "Exe", "Monitors"] + (["In-game HDR"] if Build.dev() else []) + ["On launch"]
+            self.columns = ["Game", "Exe", "Monitors"] + (["In-game HDR"] if Build.dev() else []) + ["Display mode", "On launch"]
             self.table = QTableWidget(0, len(self.columns))
             self.table.setHorizontalHeaderLabels(self.columns)
             self.table.verticalHeader().hide()
@@ -1389,6 +1604,11 @@ def run_ui(args):
                     line("On-screen notice", Toggle(cfg.show_osd, flag("show_osd"))),
                     line("Auto HDR for games", Toggle(cfg.games_enabled, flag("games_enabled"))),
                     muted("Desktop: " + self.a.backend.desktop)]
+            if Updates.offered():
+                latest = self.a.updates.latest
+                rows.insert(4, line("Version %s%s" % (VERSION, "  ·  %s is available" % latest if latest else ""),
+                                    button("Download" if latest else "Releases", self.a.updates.open, primary=bool(latest))))
+                rows.insert(4, line("Check for updates", Toggle(cfg.updates_enabled, flag("updates_enabled"))))
             if Usage.offered():
                 rows.insert(4, line("Anonymous active user count", Toggle(cfg.usage_enabled, flag("usage_enabled"))))
             if Build.channel != "release":
@@ -1481,10 +1701,18 @@ def run_ui(args):
             grid.setContentsMargins(18, 12, 18, 12)
             events = [("HDR banner", lambda: show_banner(first(), "")),
                       ("HDR banner: game", lambda: show_banner(first(), test.name)),
+                      ("HDR banner: display mode", lambda: show_banner(first(), test.name, "2560 × 1440  ·  165 Hz")),
                       ("HDR off notice", lambda: show_notice("HDR OFF  ·  " + first())),
                       ("HDR failed notice", lambda: show_notice("HDR didn't turn on  ·  " + first())),
                       ("Game closed notice", lambda: show_notice(test.name + " closed  ·  HDR OFF  ·  " + first())),
                       ("OLED care notice", lambda: show_notice("OLED care  ·  HDR OFF  ·  " + first())),
+                      ("Display mode notice", lambda: show_notice(test.name + "  ·  2560 × 1440 @ 165 Hz  ·  " + first())),
+                      ("Display mode failed notice",
+                       lambda: show_notice(test.name + "  ·  couldn't switch " + first() + " to 2560 × 1440 @ 480 Hz", 7000)),
+                      ("Display mode restored notice",
+                       lambda: show_notice(test.name + " closed  ·  HDR OFF  ·  " + first() + "  ·  display mode restored")),
+                      ("Update notice", self.a.pretend_update),  # also adds the tray menu item and Settings row
+                      ("Updated notice", lambda: show_notice("Updated to %s  ·  the old version was closed" % VERSION, 5000)),
                       ("Game prompt", lambda: GamePrompt(test, [first()], True).present()),
                       ("Crash report", lambda: log("Test crash from the Dev tab"))]
             for i in range(0, len(events), 2):
@@ -1501,6 +1729,7 @@ def run_ui(args):
                 cells = [g.name, g.exe_file, ", ".join(g.monitors.values())]
                 if Build.dev():
                     cells.append({True: "On", False: "Off"}.get(GameConfig.enabled_in(g.config), "—"))
+                cells.append(mode_summary(g))
                 cells.append("Ask" if g.ask else "Automatic")
                 for col, text in enumerate(cells):
                     item = QTableWidgetItem(text)
@@ -1536,6 +1765,9 @@ def run_ui(args):
             """Double-clicking a cell opens that cell's options as a dropdown."""
             g = cfg.games[row]
             title = self.columns[col]
+            if title == "Display mode":  # resolution and refresh rate need several pickers, so open the full options
+                self.edit_game(row)
+                return
             menu = QMenu(self)
             if title == "Game":
                 menu.addAction("Rename / edit all options…", lambda: self.edit_game(row))
@@ -1582,10 +1814,16 @@ def run_ui(args):
             self.focus = Focus()
             self.oled = OledCare()
             self.usage = Usage()
+            self.updates = Updates()
             self.settings = None
             self.running = {}     # exe file name -> Game
             self.auto_on = {}     # monitor -> exe names holding it on
             self.mode_set = {}    # monitor -> (mode to go back to, exe names holding the change)
+            self.mode_applied = {}  # exe name -> the display mode setting it started with, to apply changes made while it runs
+            self.guard = ModeGuard()
+            self.mode_pending = {}     # monitor -> (exe name, own_size, mode): waiting for the monitor to settle
+            self.restore_pending = {}  # monitor -> mode to go back to, waiting likewise
+            self.hdr_pending = {}      # monitor -> (on, done, reapply): HDR switches waiting for the monitor's own mode
             self.prompts = {}
             self.last_indicator = None
             for m in self.backend.monitors():
@@ -1598,6 +1836,8 @@ def run_ui(args):
             self.build_menu()
             self.tray.setContextMenu(self.menu)
             self.tray.activated.connect(self.tray_click)
+            self.tray.messageClicked.connect(lambda: self.updates.open() if self.update_message else None)
+            self.update_message = False  # the tray message showing is the update notice
             self.tray.show()
             theme.changed.connect(self.force_indicator)
 
@@ -1606,7 +1846,7 @@ def run_ui(args):
             self.server.listen(socket_name)
             self.server.newConnection.connect(self.command)
 
-            app.aboutToQuit.connect(lambda: self.restore_modes(None))  # don't leave a game's display mode behind
+            app.aboutToQuit.connect(lambda: self.restore_modes(None, wait=True))  # don't leave a game's display mode behind
             self.check_games()
             self.update_indicator()
             self.timer = QTimer(self)
@@ -1625,6 +1865,8 @@ def run_ui(args):
                 self.open_settings()
             if isinstance(self.backend, NoBackend):
                 show_notice("HDR needs Plasma 6 or GNOME 48+ on Wayland", 7000)
+            elif replaced:
+                show_notice("Updated to %s  ·  the old version was closed" % VERSION, 5000)
 
         def ask_startup(self):
             answer = QMessageBox.question(None, Build.name(), "Start %s when you log in?" % Build.name())
@@ -1659,12 +1901,38 @@ def run_ui(args):
 
         def tick(self):
             self.check_games()
+            self.update_running_modes()
+            self.switch_pending_hdr()
+            self.apply_pending()
             self.check_oled()
             self.update_indicator()
             self.usage.tick(cfg)
+            if self.updates.tick(cfg):
+                self.announce_update()
+
+        def pretend_update(self):
+            """Dev tab: acts as if the next minor version had just been released."""
+            major, minor, _ = parse_version(VERSION)
+            self.updates.latest, self.updates.page = "%d.%d.0" % (major, minor + 1), Updates.RELEASES_PAGE
+            cfg.update_notified = ""
+            self.announce_update()
+
+        def announce_update(self):
+            """Each release is announced once; after that it stays in the tray menu and Settings until updated."""
+            if cfg.update_notified == self.updates.latest:
+                return
+            cfg.update_notified = self.updates.latest
+            cfg.save()
+            self.update_message = True
+            self.tray.showMessage("%s %s is out" % (Build.name(), self.updates.latest), "Click here to get it from GitHub.",
+                                  QSystemTrayIcon.MessageIcon.Information, 15000)
+            if not QSystemTrayIcon.isSystemTrayAvailable() or not QSystemTrayIcon.supportsMessages():
+                show_notice("%s %s is out  ·  see Settings to download it" % (Build.name(), self.updates.latest), 7000)
 
         def command(self):
             sock = self.server.nextPendingConnection()
+
+            peer = {}
 
             def read():
                 text = bytes(sock.readAll()).decode()
@@ -1672,6 +1940,13 @@ def run_ui(args):
                     self.toggle(text.split(" ", 1)[1].split(","))
                 elif text == "show":
                     self.open_settings()
+                elif text.startswith("hello "):  # a newly launched copy, checking whether it's newer
+                    peer["version"] = text[6:]
+                    sock.write(("version " + VERSION).encode())
+                    sock.flush()
+                elif text == "quit" and is_newer(peer.get("version"), VERSION):
+                    log("Closing for version " + peer["version"])
+                    app.quit()
 
             sock.readyRead.connect(read)
             sock.disconnected.connect(sock.deleteLater)
@@ -1691,6 +1966,11 @@ def run_ui(args):
             self.menu.addSeparator()
             for g in self.running.values():
                 self.menu.addAction("Detected: " + g.name).setEnabled(False)
+            if self.updates.latest:
+                update = self.menu.addAction("Update available: " + self.updates.latest, self.updates.open)
+                bold = update.font()
+                bold.setBold(True)
+                update.setFont(bold)
             self.menu.addAction("Settings", self.open_settings)
             self.menu.addAction("Exit", app.quit)
 
@@ -1710,8 +1990,9 @@ def run_ui(args):
             if cfg.show_osd:
                 show_notice(text, ms)
 
-        def announce_on(self, monitors, detail):
-            """Waits for the display to settle, re-reads the real state, and only then shows the banner."""
+        def announce_on(self, monitors, detail, game=None):
+            """Waits for the display to settle, re-reads the real state, and only then shows the banner.
+            With a game, the banner also shows the resolution and refresh rate it set on that monitor."""
             if not monitors:
                 return
             ids = {m.id for m in monitors}
@@ -1720,7 +2001,9 @@ def run_ui(args):
                 now = [m for m in self.backend.monitors() if m.id in ids]
                 for m in now:
                     if m.hdr_on and cfg.show_osd:
-                        show_banner(m.name, detail)
+                        # A mode change still waiting for the monitor to settle: show the mode it's switching to.
+                        target = replace(m, current=self.mode_pending[m.id][2]) if m.id in self.mode_pending else m
+                        show_banner(m.name, detail, banner_mode_line(game, target))
                 missed = [m.name for m in now if not m.hdr_on]
                 if missed:
                     self.notify("HDR didn't turn on  ·  " + ", ".join(missed))
@@ -1734,11 +2017,22 @@ def run_ui(args):
                 self.notify("No HDR monitor from this hotkey is connected")
                 return
             turn_on = any(not m.hdr_on for m in targets)  # mixed -> all on; all on -> all off
-            failed = [m.name for m in targets if not self.backend.set_hdr(m, turn_on)]
+
+            def later(mon, ok):  # a switch that had to wait for a game's display mode to go back first
+                if not ok:
+                    self.notify("Could not change HDR on " + mon.name)
+                elif turn_on:
+                    self.announce_on([mon], "")
+                else:
+                    self.notify("HDR OFF  ·  " + mon.name)
+
+            results = {m.name: self.switch_hdr(m, turn_on, later) for m in targets}
+            failed = [name for name, ok in results.items() if ok is False]
+            now = [m for m in targets if results[m.name] is True]
             if turn_on:
-                self.announce_on([m for m in targets if m.name not in failed], "")
-            else:
-                self.notify("HDR OFF  ·  " + ", ".join(m.name for m in targets))
+                self.announce_on(now, "")
+            elif now:
+                self.notify("HDR OFF  ·  " + ", ".join(m.name for m in now))
             if failed:
                 self.notify("Failed: " + ", ".join(failed))
             self.update_indicator()
@@ -1759,24 +2053,96 @@ def run_ui(args):
                     del self.running[key]
                     self.game_stopped(g, key)
 
+        def set_hdr(self, m, on):
+            ok = self.backend.set_hdr(m, on)
+            self.guard.touched(m.id)  # switching HDR can make the desktop set the display mode again
+            return ok
+
+        def own_mode(self, m):
+            """Whether the monitor is in its own mode, the one from before any game changed it."""
+            original = self.mode_set[m.id][0] if m.id in self.mode_set else self.restore_pending.get(m.id)
+            return not original or m.current == original
+
+        def switch_hdr(self, m, on, done=None, reapply=True):
+            """HDR only switches while the monitor is in its own mode, and not right after another change: on Windows,
+            turning HDR off while a game's resolution was active crashed the graphics driver (every screen black, audio
+            gone). With a game's mode active, the monitor goes back to its own mode first and HDR switches once it has
+            settled; reapply then puts the game's mode back. Returns True/False when HDR switched now, or None when
+            it's waiting (done(monitor, ok) runs later)."""
+            if m.id not in self.hdr_pending and self.guard.wait(m.id) == 0 and self.own_mode(m):
+                ok = self.set_hdr(m, on)
+                self.reapply_game_mode(m.id, reapply)
+                return ok
+            self.hdr_pending[m.id] = (on, done, reapply)
+            log("HDR %s on %s waits until it's settled in its own mode" % ("on" if on else "off", m.name))
+            self.switch_pending_hdr()
+            return None
+
+        def switch_pending_hdr(self):
+            """From the poll timer: the HDR switches that are waiting (see switch_hdr)."""
+            if not self.hdr_pending:
+                return
+            mons = {m.id: m for m in self.backend.monitors()}
+            for mon_id, (on, done, reapply) in list(self.hdr_pending.items()):
+                m = mons.get(mon_id)
+                if m is None:
+                    del self.hdr_pending[mon_id]
+                    continue
+                if self.guard.wait(mon_id) > 0:
+                    continue
+                if not self.own_mode(m):
+                    original = self.mode_set[mon_id][0] if mon_id in self.mode_set else self.restore_pending.pop(mon_id)
+                    self.set_mode(m, original)  # one change back; HDR follows once it has settled
+                    continue
+                del self.hdr_pending[mon_id]
+                ok = m.hdr_on == on or self.set_hdr(m, on)
+                self.reapply_game_mode(mon_id, reapply)
+                if done:
+                    done(m, ok)
+                self.update_indicator()
+
+        def reapply_game_mode(self, mon_id, reapply):
+            """After HDR switched in the monitor's own mode: a running game's mode goes back on, once it has settled."""
+            if reapply and mon_id in self.mode_set and self.mode_set[mon_id][1]:
+                self.mode_pending[mon_id] = (next(iter(self.mode_set[mon_id][1])), False, None)
+
+        def set_mode(self, m, mode):
+            if m.id in self.guard.blocked:
+                return False
+            start = time.monotonic()
+            ok = self.backend.set_mode(m, mode)
+            if self.guard.result(m.id, ok, time.monotonic() - start):
+                self.notify("The desktop had trouble switching %s's display mode, so HDR Ultimate won't change it again "
+                            "until it restarts. HDR still works as normal." % m.name, 9000)
+            return ok
+
         def game_started(self, g, key):
             log("Game started: %s (%s)" % (g.name, g.exe))
-            self.apply_mode(g, key)
+            self.mode_applied[key] = running_mode_setting(g)
+            # HDR first, then the game's mode in one change once the monitor has settled (see ModeGuard).
+            quiet = self.start_hdr(g, key)
+            notice = self.apply_mode(g, key)
+            if notice and not quiet:
+                self.notify(notice)
+
+        def start_hdr(self, g, key):
+            """Turns HDR on for a game, or asks. Returns True when the mode notice should stay quiet: the HDR banner
+            shows the mode, or a more important message did."""
             for path in g.monitors:
                 if path in self.auto_on:
                     self.auto_on[path].add(key)
             off = [m for m in self.backend.monitors() if m.hdr_supported and m.id in g.monitors and not m.hdr_on]
             if not off:
-                return  # HDR already on everywhere this game wants it
+                return False  # HDR already on everywhere this game wants it
             g.config = GameConfig.find(g) or ""
             in_game = GameConfig.enabled_in(g.config)
             log("In-game HDR for %s: %s (%s)" % (g.name, in_game, g.config or "no settings file"))
             if in_game is False and g.skip_if_off:
                 self.notify(g.name + ": HDR is off in the game's settings  ·  HDR left off", 7000)
-                return
+                return True
             if not g.ask:
                 self.enable_for(g, key)
-                return
+                return cfg.show_osd and any(m.id == g.mode_monitor for m in off)  # the banner on that monitor shows it
             prompt = GamePrompt(g, [m.name for m in off], in_game)
 
             def answered(answer):
@@ -1790,32 +2156,92 @@ def run_ui(args):
             prompt.answered.connect(answered)
             self.prompts[key] = prompt
             prompt.present()
+            return False
 
-        def apply_mode(self, g, key):
+        def apply_mode(self, g, key, own_size=False):
             """Switches the game's monitor to its resolution and refresh rate. A monitor already in that mode
-            is left alone afterwards too, the same as HDR."""
+            is left alone afterwards too, the same as HDR. Returns the notice to show for a change, or None.
+            own_size: where the game doesn't set a resolution, use the monitor's own from before the game."""
             width, height = g.desktop_size
             if not g.has_mode or (width == 0 and g.mode_hz == 0):
-                return  # in-game resolution only: written when the game closes
+                return None  # in-game resolution only: written when the game closes
             m = next((x for x in self.backend.monitors() if x.id == g.mode_monitor), None)
             if not m:
                 log("Display mode for %s: monitor not connected" % g.name)
-                return
+                return None
+            if own_size and width == 0 and m.id in self.mode_set and self.mode_set[m.id][0]:
+                width, height = self.mode_set[m.id][0][:2]
             mode = pick_mode(m, width, height, g.mode_hz)
-            if mode is None or (mode != m.current and not self.backend.set_mode(m, mode)):
-                self.notify("%s  ·  couldn't switch %s to %s" % (g.name, m.name, describe_mode(width, height, g.mode_hz)), 7000)
-                return
+            if mode is None or m.id in self.guard.blocked:
+                if m.id not in self.guard.blocked:  # that has its own notice
+                    self.notify("%s  ·  couldn't switch %s to %s" % (g.name, m.name, describe_mode(width, height, g.mode_hz)), 7000)
+                return None
             if m.id not in self.mode_set:
                 if mode == m.current:
-                    return
+                    return None
                 self.mode_set[m.id] = (m.current, set())
             self.mode_set[m.id][1].add(key)
-            if mode != m.current:
-                log("Set display mode %s on %s" % (describe_mode(*mode), m.name))
-                self.notify("%s  ·  %s  ·  %s" % (g.name, describe_mode(*mode), m.name))
+            self.mode_pending.pop(m.id, None)
+            if mode == m.current:
+                return None
+            if not self.guard.ready(m.id) or m.id in self.hdr_pending:  # too soon, or HDR is waiting: apply_pending does it
+                self.mode_pending[m.id] = (key, own_size, mode)
+                return None
+            if not self.set_mode(m, mode):
+                if m.id not in self.guard.blocked:
+                    self.notify("%s  ·  couldn't switch %s to %s" % (g.name, m.name, describe_mode(*mode)), 7000)
+                return None
+            log("Set display mode %s on %s" % (describe_mode(*mode), m.name))
+            return "%s  ·  %s  ·  %s" % (g.name, describe_mode(*mode), m.name)
 
-        def restore_modes(self, key):
-            """Puts back each monitor's mode from before the game once no running game holds it (key None = all)."""
+        def apply_pending(self):
+            """From the poll timer: the mode changes that had to wait for their monitor to settle."""
+            mons = {m.id: m for m in self.backend.monitors()} if self.mode_pending or self.restore_pending else {}
+            for mon_id, (key, own_size, _) in list(self.mode_pending.items()):
+                if mon_id in self.hdr_pending or (not self.guard.ready(mon_id) and mon_id not in self.guard.blocked):
+                    continue
+                del self.mode_pending[mon_id]
+                g = next((x for x in cfg.games if x.exe_file.lower() == key), None)
+                if g is not None and key in self.running:
+                    self.apply_mode(g, key, own_size)  # quietly: the banner already said what it's switching to
+            for mon_id, original in list(self.restore_pending.items()):
+                if mon_id in self.hdr_pending:
+                    continue  # switch_pending_hdr puts it back first
+                if mon_id in self.mode_set:  # another game took the monitor meanwhile
+                    del self.restore_pending[mon_id]
+                elif self.guard.wait(mon_id) == 0:
+                    del self.restore_pending[mon_id]
+                    m = mons.get(mon_id)
+                    if m and m.current != original and self.set_mode(m, original):
+                        log("Restored display mode on " + m.name)
+
+        def update_running_modes(self):
+            """A running game's resolution or refresh rate was changed in Settings: switch to the new one now."""
+            for key in list(self.running):
+                # cfg.games, because editing a running game replaces its object.
+                g = next((x for x in cfg.games if x.exe_file.lower() == key), None)
+                if g is None or key not in self.mode_applied:
+                    continue
+                before, now = self.mode_applied[key], running_mode_setting(g)
+                if before == now:
+                    continue
+                self.mode_applied[key] = now
+                log("Display mode for %s changed while it runs: %s" % (g.name, now or "none"))
+                # Same monitor: switch straight to the new mode, in one change. When the resolution goes back to
+                # "Don't change", that's the monitor's own resolution, not the game's. Another monitor, or none:
+                # put the old monitor back first.
+                size_dropped = bool(before) and before[1] > 0 and now[1:2] == (0,)
+                restored = bool(self.restore_modes(key)) if not now or before[:1] != (g.mode_monitor,) else False
+                notice = self.apply_mode(g, key, own_size=size_dropped) if now else None
+                if notice:
+                    self.notify(notice)
+                elif restored:
+                    self.notify(g.name + "  ·  display mode restored")
+
+        def restore_modes(self, key, wait=False):
+            """Puts back each monitor's mode from before the game once no running game holds it (key None = all).
+            A change that would land right after another waits for the monitor to settle: in apply_pending, or
+            here with wait=True (when quitting)."""
             restored = []
             mons = {m.id: m for m in self.backend.monitors()} if self.mode_set else {}
             for mon_id, (original, holders) in list(self.mode_set.items()):
@@ -1826,10 +2252,20 @@ def run_ui(args):
                     if holders:
                         continue
                 del self.mode_set[mon_id]
+                self.mode_pending.pop(mon_id, None)
                 m = mons.get(mon_id)
-                if m and original and (m.current == original or self.backend.set_mode(m, original)):
-                    log("Restored display mode on " + m.name)
+                if not (m and original):
+                    continue
+                if m.current == original:
                     restored.append(m.name)
+                elif self.guard.wait(mon_id) > 0 and not wait:
+                    self.restore_pending[mon_id] = original
+                    restored.append(m.name)
+                else:
+                    time.sleep(self.guard.wait(mon_id))
+                    if self.set_mode(m, original):
+                        log("Restored display mode on " + m.name)
+                        restored.append(m.name)
             return restored
 
         def enable_for(self, g, key):
@@ -1839,20 +2275,26 @@ def run_ui(args):
                     continue
                 if m.id in self.auto_on:
                     self.auto_on[m.id].add(key)
-                elif not m.hdr_on and self.backend.set_hdr(m, True):  # already on: leave it on afterwards too
+                elif not m.hdr_on:  # already on: leave it on afterwards too
+                    result = self.switch_hdr(m, True, lambda mon, ok: ok and self.announce_on([mon], g.name, g))
+                    if result is False:
+                        continue
                     self.auto_on[m.id] = {key}
-                    changed.append(m)
-            self.announce_on(changed, g.name)
+                    if result:
+                        changed.append(m)
+            self.announce_on(changed, g.name, g)
             self.update_indicator()
 
         def game_stopped(self, g, key):
             log("Game stopped: " + g.name)
+            self.mode_applied.pop(key, None)
             if key in self.prompts:
                 self.prompts.pop(key).dismiss()
-            mode_restored = bool(self.restore_modes(key))
             # The game saved its own settings as it exited, so put the chosen resolution back for next time.
             # cfg.games, because editing a running game replaces its object.
             GameConfig.apply_resolution(next((x for x in cfg.games if x.exe == g.exe), g))
+            # The display mode goes back first, then HDR turns off once the monitor has settled (see switch_hdr).
+            mode_restored = bool(self.restore_modes(key))
             mons = {m.id: m for m in self.backend.monitors()}
             changed = []
             for path, holders in list(self.auto_on.items()):
@@ -1863,7 +2305,10 @@ def run_ui(args):
                     continue  # another HDR game still needs it
                 del self.auto_on[path]
                 m = mons.get(path)
-                if g.restore and m and m.hdr_on and self.backend.set_hdr(m, False):
+                if not (g.restore and m and m.hdr_on):
+                    continue
+                result = self.switch_hdr(m, False, lambda mon, ok: ok and self.notify("%s closed  ·  HDR OFF  ·  %s" % (g.name, mon.name)))
+                if result:
                     changed.append(m.name)
             parts = (["HDR OFF  ·  " + ", ".join(changed)] if changed else []) + (["display mode restored"] if mode_restored else [])
             if parts:
@@ -1879,11 +2324,15 @@ def run_ui(args):
                 return
             restore, turn_off = self.oled.tick(time.monotonic(), self.backend.monitors(), running, self.focus.game(running),
                                                cfg.oled_enabled, cfg.oled_minutes * 60)
-            turned = [m for m in restore if self.backend.set_hdr(m, True)]
+            # A switch that has to wait (switch_hdr) counts as done here; OLED care's own state has already moved on.
+            turned = [m for m in restore if self.switch_hdr(m, True, lambda mon, ok: ok and self.announce_on([mon], "")) is True]
             if turned:
                 log("OLED care restored HDR: " + ", ".join(m.name for m in turned))
                 self.announce_on(turned, "")
-            names = [m.name for m in turn_off if self.backend.set_hdr(m, False)]
+            # While tabbed out the monitor stays in its own mode (reapply=False); the game's mode comes back with HDR.
+            names = [m.name for m in turn_off
+                     if self.switch_hdr(m, False, lambda mon, ok: ok and self.notify("OLED care  ·  HDR OFF  ·  " + mon.name),
+                                        reapply=False) is True]
             if names:
                 log("OLED care turned HDR off: " + ", ".join(names))
                 self.notify("OLED care  ·  HDR OFF  ·  " + ", ".join(names))

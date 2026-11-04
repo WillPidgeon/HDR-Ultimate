@@ -66,7 +66,9 @@ class Parsing(unittest.TestCase):
         m = Monitor("DP-1", "X", modes=[(2560, 1440, 144), (2560, 1440, 60), (1920, 1080, 60)], current=(2560, 1440, 144))
         self.assertEqual(h.pick_mode(m, 1920, 1080, 0), (1920, 1080, 60))   # 144 not offered there: fastest it has
         self.assertEqual(h.pick_mode(m, 0, 0, 60), (2560, 1440, 60))        # refresh only
-        self.assertIsNone(h.pick_mode(m, 1920, 1080, 144))
+        self.assertEqual(h.pick_mode(m, 1920, 1080, 144), (1920, 1080, 60))  # 144 not offered: the fastest below it
+        self.assertIsNone(h.pick_mode(m, 1920, 1080, 30))                   # nothing at or below 30
+        self.assertIsNone(h.pick_mode(m, 1280, 720, 0))                     # resolution not offered
 
     def test_gnome_mode_change_moves_neighbours(self):
         first = h.gnome_monitors(GNOME_STATE)[0]  # two 144 Hz modes: the current one's id wins
@@ -194,6 +196,137 @@ class UsageCheckIn(unittest.TestCase):
             run(h.Config(usage_asked=True, usage_enabled=False))
             run(h.Config(usage_asked=False))
             self.assertEqual(len(seen), 1)
+        finally:
+            h.Build.channel = channel
+            server.shutdown()
+
+
+class Guard(unittest.TestCase):
+    def setUp(self):
+        self.now = [100.0]
+        self.g = h.ModeGuard(clock=lambda: self.now[0])
+
+    def test_spacing(self):
+        self.assertTrue(self.g.ready("DP-1"))
+        self.assertFalse(self.g.result("DP-1", True, 0.2))
+        self.now[0] += 1
+        self.assertFalse(self.g.ready("DP-1"))
+        self.assertAlmostEqual(self.g.wait("DP-1"), 3.0)
+        self.assertAlmostEqual(self.g.wait("DP-2"), 0.5)  # another monitor: the short gap
+        self.now[0] += 3
+        self.assertTrue(self.g.ready("DP-1"))
+        self.g.touched("DP-1")  # HDR switched
+        self.assertFalse(self.g.ready("DP-1"))
+
+    def test_switches_off_after_trouble(self):
+        self.assertFalse(self.g.result("DP-1", False, 0.1))
+        self.assertTrue(self.g.result("DP-1", False, 0.1))  # second failure
+        self.assertIn("DP-1", self.g.blocked)
+        self.assertFalse(self.g.ready("DP-1"))
+        self.assertTrue(self.g.result("DP-2", True, 6.0))  # one slow change is enough
+        self.assertFalse(self.g.result("DP-2", True, 6.0))  # reported once
+        self.assertFalse(self.g.result("DP-3", False, 0.1))
+        self.assertFalse(self.g.result("DP-3", True, 0.1))  # a success clears the count
+        self.assertFalse(self.g.result("DP-3", False, 0.1))
+        self.assertNotIn("DP-3", self.g.blocked)
+
+
+class RefreshRates(unittest.TestCase):
+    def test_fallback_up_to_480(self):
+        offered = [240, 165, 144, 120, 60]
+        self.assertEqual(h.fallback_rate(offered, 165), 165)
+        self.assertEqual(h.fallback_rate(offered, 480), 240)
+        self.assertEqual(h.fallback_rate(offered, 200), 165)
+        self.assertEqual(h.fallback_rate(offered, 50), 0)
+        self.assertEqual(max(h.COMMON_RATES), 480)
+
+    def test_pick_mode_uses_fallback(self):
+        mon = Monitor(id="DP-1", name="X27U", modes=[(2560, 1440, 240), (2560, 1440, 144), (1920, 1080, 240)], current=(2560, 1440, 144))
+        self.assertEqual(h.pick_mode(mon, 0, 0, 480), (2560, 1440, 240))
+        self.assertEqual(h.pick_mode(mon, 1920, 1080, 360), (1920, 1080, 240))
+        self.assertIsNone(h.pick_mode(mon, 0, 0, 30))
+
+
+class UpdateCheck(unittest.TestCase):
+    def test_versions(self):
+        self.assertEqual(h.parse_version("V1.2"), (1, 2, 0))
+        self.assertEqual(h.parse_version("1.3.1"), (1, 3, 1))
+        self.assertIsNone(h.parse_version("latest"))
+        self.assertIsNone(h.parse_version(None))
+        self.assertFalse(h.is_newer("V1.2", "1.3.0"))
+        self.assertFalse(h.is_newer("V1.3", "1.3.0"))
+        self.assertTrue(h.is_newer("v1.3.1", "1.3.0"))
+        self.assertTrue(h.is_newer("V2.0", "1.3.0"))
+
+    def test_mode_summary(self):
+        self.assertEqual(h.mode_summary(Game()), "Don't change")
+        self.assertEqual(h.mode_summary(Game(mode_monitor="DP-1", mode_width=2560, mode_height=1440, mode_hz=165)), "2560×1440 165Hz")
+        self.assertEqual(h.mode_summary(Game(mode_monitor="DP-1", mode_width=1920, mode_height=1080, mode_hz=120, mode_in_game=True)),
+                         "1920×1080 120Hz in-game")
+
+    def test_banner_mode_line(self):
+        mon = Monitor(id="DP-1", name="X27U", hdr_supported=True, hdr_on=True)
+        mon.current = (2560, 1440, 165)
+        self.assertIsNone(h.banner_mode_line(None, mon))
+        self.assertIsNone(h.banner_mode_line(Game(), mon))
+        self.assertIsNone(h.banner_mode_line(Game(mode_monitor="DP-2", mode_hz=144), mon))  # set on another monitor
+        self.assertEqual(h.banner_mode_line(Game(mode_monitor="DP-1", mode_width=2560, mode_height=1440, mode_hz=165), mon),
+                         "2560 × 1440  ·  165 Hz")
+        self.assertEqual(h.banner_mode_line(Game(mode_monitor="DP-1", mode_width=1920, mode_height=1080, mode_in_game=True), mon),
+                         "1920 × 1080 in game  ·  165 Hz")
+
+    def test_finds_newer_release_and_only_links_to_github(self):
+        import json
+        import os
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        reply = {}
+        agents = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                agents.append(self.headers["User-Agent"])
+                body = json.dumps(reply["json"]).encode() if "json" in reply else b"<html>sign in</html>"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        os.environ[h.Updates.TEST_VARIABLE] = "http://127.0.0.1:%d/" % server.server_port
+        channel, h.Build.channel = h.Build.channel, "dev"
+        try:
+            def run(json_reply, config=None):
+                if json_reply is None:
+                    reply.pop("json", None)
+                else:
+                    reply["json"] = json_reply
+                updates = h.Updates()
+                updates.next_try = 0
+                config = config or h.Config()
+                self.assertFalse(updates.tick(config))
+                while updates.checking:
+                    time.sleep(0.01)
+                return updates, updates.tick(config)
+
+            page = "https://github.com/WillPidgeon/HDR-Ultimate/releases/tag/V9.1"
+            updates, found = run({"tag_name": "V9.1", "html_url": page})
+            self.assertTrue(found)
+            self.assertEqual((updates.latest, updates.page), ("9.1.0", page))
+            self.assertEqual(agents[-1], "HDRUltimate")
+            updates, found = run({"tag_name": "V9.2", "html_url": "https://evil.example/x"})
+            self.assertEqual(updates.page, h.Updates.RELEASES_PAGE)
+            self.assertFalse(run({"tag_name": "V1.0", "html_url": page})[1])  # older: nothing
+            self.assertFalse(run(None)[1])  # a Wi-Fi sign-in page: nothing
+            calls = len(agents)
+            self.assertFalse(run({"tag_name": "V9.1"}, h.Config(updates_enabled=False))[1])
+            self.assertEqual(len(agents), calls)  # switched off: no request at all
         finally:
             h.Build.channel = channel
             server.shutdown()
