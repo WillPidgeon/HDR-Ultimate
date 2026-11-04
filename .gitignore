@@ -30,3 +30,6 @@ config.json
 log.txt
 *.log
 .claude/
+
+# The website lives only on the server
+website/
