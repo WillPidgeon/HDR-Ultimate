@@ -26,7 +26,7 @@ namespace HdrUltimate
     // Each channel has its own name, settings folder and startup entry, so builds never touch each other's data.
     static class Build
     {
-        public const string Version = "1.3.4";
+        public const string Version = "1.3.0";
 #if DEV
         public const string Name = "HDR Ultimate Dev", Channel = "dev", RunName = "HDRUltimateDev", OldRunName = RunName;
         public const bool Dev = true, Release = false, InGameHdrColumn = true;

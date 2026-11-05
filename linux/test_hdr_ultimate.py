@@ -332,5 +332,51 @@ class UpdateCheck(unittest.TestCase):
             server.shutdown()
 
 
+class SocketPaths(unittest.TestCase):
+    """The single-instance socket must be somewhere only this user can reach (faked Linux file owners)."""
+
+    def paths(self, runtime_uid=1000, runtime_mode=0o700, legacy_uid=None, runtime="/run/user/1000"):
+        import os
+        from types import SimpleNamespace
+        from unittest import mock
+
+        def fake_stat(path):
+            if path == runtime:
+                return SimpleNamespace(st_uid=runtime_uid, st_mode=0o40000 | runtime_mode)
+            raise FileNotFoundError(path)
+
+        def fake_lstat(path):
+            if legacy_uid is None:
+                raise FileNotFoundError(path)
+            return SimpleNamespace(st_uid=legacy_uid)
+
+        env = {"XDG_RUNTIME_DIR": runtime} if runtime else {}
+        with mock.patch.object(h.os, "getuid", lambda: 1000, create=True), \
+                mock.patch.object(h.os, "stat", fake_stat), mock.patch.object(h.os, "lstat", fake_lstat), \
+                mock.patch.object(h.os, "chmod", lambda *a: None), mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(h.Path, "home", lambda: h.Path("/home/me")), \
+                mock.patch.object(h.Path, "mkdir", lambda *a, **k: None):
+            sock, legacy = h.socket_paths()
+        return sock.replace("\\", "/"), legacy and legacy.replace("\\", "/")
+
+    def test_private_runtime_folder(self):
+        sock, legacy = self.paths()
+        self.assertTrue(sock.startswith("/run/user/1000/hdr-ultimate"), sock)
+        self.assertIsNone(legacy)
+
+    def test_runtime_folder_others_can_open_is_not_used(self):
+        self.assertTrue(self.paths(runtime_mode=0o755)[0].startswith("/home/me/.cache/hdr-ultimate/"))
+
+    def test_runtime_folder_owned_by_someone_else_is_not_used(self):
+        self.assertTrue(self.paths(runtime_uid=0)[0].startswith("/home/me/.cache/hdr-ultimate/"))
+
+    def test_no_runtime_folder(self):
+        self.assertTrue(self.paths(runtime=None)[0].startswith("/home/me/.cache/hdr-ultimate/"))
+
+    def test_old_tmp_socket_only_if_ours(self):
+        self.assertTrue(self.paths(legacy_uid=1000)[1].endswith("/hdr-ultimate" + h.Build.suffix()))
+        self.assertIsNone(self.paths(legacy_uid=1001)[1])
+
+
 if __name__ == "__main__":
     unittest.main()

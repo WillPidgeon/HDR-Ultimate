@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.3.4"
+VERSION = "1.3.0"
 OLED_MIN_MINUTES, OLED_MAX_MINUTES = 1, 30
 ICON_NAME = "hdr-ultimate"
 
@@ -252,6 +252,35 @@ class Updates:
 
     def open(self):
         subprocess.Popen(["xdg-open", self.page or self.RELEASES_PAGE])
+
+
+def socket_paths():
+    """Where running copies talk to each other: (this version's socket, the shared-/tmp one earlier versions used).
+
+    The socket lives in the user's private runtime folder, so no other account on the PC can connect to it or put
+    its own socket in its place. The old /tmp path is only returned when it belongs to this user."""
+    name = "hdr-ultimate" + Build.suffix()
+    if not hasattr(os, "getuid"):
+        return name, None  # Windows, where the tests run: Qt uses a named pipe instead
+    base = None
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        try:
+            st = os.stat(runtime)
+            if st.st_uid == os.getuid() and not st.st_mode & 0o077:
+                base = Path(runtime)
+        except OSError:
+            pass
+    if base is None:
+        base = Path.home() / ".cache" / "hdr-ultimate"
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(base, 0o700)
+    legacy = os.path.join(os.environ.get("TMPDIR") or "/tmp", name)
+    try:
+        legacy = legacy if os.lstat(legacy).st_uid == os.getuid() else None
+    except OSError:
+        legacy = None
+    return str(base / (name + ".sock")), legacy
 
 
 def stop_old_copies():
@@ -1003,7 +1032,7 @@ def run_ui(args):
                                    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea,
                                    QSlider, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
-    socket_name = "hdr-ultimate" + Build.suffix()
+    socket_name, legacy_socket = socket_paths()
 
     def send(sock, text):
         sock.write(text.encode())
@@ -1013,7 +1042,11 @@ def run_ui(args):
     replaced = False
     probe = QLocalSocket()
     probe.connectToServer(socket_name)
-    if probe.waitForConnected(300):
+    connected = probe.waitForConnected(300)
+    if not connected and legacy_socket:  # an earlier version still running
+        probe.connectToServer(legacy_socket)
+        connected = probe.waitForConnected(300)
+    if connected:
         if args.toggle:
             send(probe, "toggle " + args.toggle)
             probe.disconnectFromServer()
@@ -1842,6 +1875,7 @@ def run_ui(args):
             theme.changed.connect(self.force_indicator)
 
             self.server = QLocalServer(self)
+            self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)  # only this user can connect
             QLocalServer.removeServer(socket_name)  # left behind by a crash
             self.server.listen(socket_name)
             self.server.newConnection.connect(self.command)
