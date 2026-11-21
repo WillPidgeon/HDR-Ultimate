@@ -458,6 +458,14 @@ class KdeBackend:
 
     def __init__(self):
         self.last = []
+        self.empties = 0
+
+    @staticmethod
+    def env():
+        env = dict(os.environ)
+        if "xcb" in env.get("QT_QPA_PLATFORM", ""):
+            env.pop("QT_QPA_PLATFORM")
+        return env
 
     @classmethod
     def parse(cls, text):
@@ -484,8 +492,11 @@ class KdeBackend:
 
     def monitors(self):
         try:
-            done = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=3)
+            done = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=3, env=self.env())
             self.last = self.parse(done.stdout + done.stderr)
+            if not self.last and self.empties == 0:
+                log("kscreen-doctor listed no outputs (exit %d): %s" % (done.returncode, (done.stdout + done.stderr).strip()[:200]))
+            self.empties = 0 if self.last else self.empties + 1
         except (OSError, subprocess.SubprocessError) as ex:
             log("kscreen-doctor failed: " + str(ex))
         return self.last
@@ -496,7 +507,7 @@ class KdeBackend:
         # kscreen-doctor can stall until the screen next redraws. Callers re-read the real state.
         try:
             subprocess.Popen(["kscreen-doctor", "output.%s.hdr.%s" % (monitor.id, word), "output.%s.wcg.%s" % (monitor.id, word)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=self.env())
             return True
         except OSError as ex:
             log("kscreen-doctor failed: " + str(ex))
@@ -505,7 +516,7 @@ class KdeBackend:
     def set_mode(self, monitor, mode):
         try:
             done = subprocess.run(["kscreen-doctor", "output.%s.mode.%s" % (monitor.id, monitor.mode_ids.get(mode, "%dx%d@%d" % mode))],
-                                  capture_output=True, text=True, timeout=10)
+                                  capture_output=True, text=True, timeout=10, env=self.env())
             return done.returncode == 0
         except (OSError, subprocess.SubprocessError) as ex:
             log("kscreen-doctor failed: " + str(ex))

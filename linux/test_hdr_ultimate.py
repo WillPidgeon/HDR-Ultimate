@@ -1,5 +1,7 @@
 """Tests for the parts that don't need a Linux desktop. Run: python -m unittest test_hdr_ultimate"""
+import os
 import unittest
+from unittest import mock
 
 import hdr_ultimate as h
 from hdr_ultimate import Game, GameConfig, KdeBackend, Monitor, OledCare
@@ -54,6 +56,50 @@ class Parsing(unittest.TestCase):
             (2560, 0, 1.25, 0, False, [("DP-2", "b144", {"color-mode": 1})]),  # stays on
             (5120, 0, 1.0, 1, False, [("HDMI-1", "c60", {})]),
         ])
+
+    def test_kde_commands_drop_the_x11_platform(self):
+        def env_for(platform):
+            return mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": platform, "KEEP": "1"})
+
+        with env_for("xcb;wayland"):
+            env = KdeBackend.env()
+            self.assertNotIn("QT_QPA_PLATFORM", env)
+            self.assertEqual(env["KEEP"], "1")
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "xcb;wayland")
+        with env_for("xcb"):
+            self.assertNotIn("QT_QPA_PLATFORM", KdeBackend.env())
+        with env_for("wayland-egl"):
+            self.assertEqual(KdeBackend.env()["QT_QPA_PLATFORM"], "wayland-egl")
+        with mock.patch.dict(os.environ, {"KEEP": "1"}, clear=False):
+            os.environ.pop("QT_QPA_PLATFORM", None)
+            self.assertNotIn("QT_QPA_PLATFORM", KdeBackend.env())
+
+        run = mock.Mock(return_value=mock.Mock(stdout=KDE_TEXT, stderr="", returncode=0))
+        burst = mock.Mock()
+        backend = KdeBackend()
+        with env_for("xcb;wayland"), mock.patch.object(h.subprocess, "run", run), mock.patch.object(h.subprocess, "Popen", burst):
+            self.assertEqual([m.id for m in backend.monitors()], ["DP-1", "DP-2", "HDMI-A-1"])
+            backend.set_hdr(backend.last[0], True)
+            backend.set_mode(backend.last[0], (2560, 1440, 144))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(burst.call_count, 1)
+        for call in list(run.call_args_list) + list(burst.call_args_list):
+            self.assertNotIn("QT_QPA_PLATFORM", call.kwargs["env"])
+            self.assertEqual(call.kwargs["env"]["KEEP"], "1")
+        self.assertEqual(run.call_args_list[0].args[0], ["kscreen-doctor", "-o"])
+
+        quiet = mock.Mock(return_value=mock.Mock(stdout="", stderr="", returncode=0))
+        with env_for("xcb"), mock.patch.object(h.subprocess, "run", quiet), mock.patch.object(h, "log") as logged:
+            backend = KdeBackend()
+            self.assertEqual(backend.monitors(), [])
+            backend.monitors()
+            self.assertEqual(logged.call_count, 1)
+            self.assertIn("no outputs", logged.call_args.args[0])
+            quiet.return_value = mock.Mock(stdout=KDE_TEXT, stderr="", returncode=0)
+            backend.monitors()
+            quiet.return_value = mock.Mock(stdout="", stderr="", returncode=0)
+            backend.monitors()
+            self.assertEqual(logged.call_count, 2)
 
     def test_kde_modes(self):
         text = KDE_TEXT.replace("\tenabled\n", "\tenabled\n\x1b[01;33m\tModes: \x1b[0;0m 1:2560x1440@144*!  2:2560x1440@59.95  3:1920x1080@60  \n", 1)

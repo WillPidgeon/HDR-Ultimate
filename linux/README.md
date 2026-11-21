@@ -33,3 +33,5 @@ HDR Ultimate tells you when a new version is out (you can turn this off under Se
 ## Troubleshooting
 
 Run `hdr-ultimate --list` to see what the app detects. To test the interface without HDR hardware, run `hdr-ultimate --dev --fake`.
+
+**KDE lists no monitors, or "Pick monitors" is empty.** Compare `kscreen-doctor -o` with `QT_QPA_PLATFORM=xcb kscreen-doctor -o`: if the first prints your outputs and the second prints nothing, that is the cause. From libkscreen 6.8 (Plasma 6.8) the XRandR backend is gone, so `kscreen-doctor` only ever loads its Wayland backend, and that one finds outputs solely through the Wayland connection of its own process. Started under X/Wayland (`QT_QPA_PLATFORM=xcb`) it therefore reports no outputs and still exits successfully. HDR Ultimate runs its own windows through XWayland and drops that variable from every `kscreen-doctor` it starts for this reason; if you set it yourself, use a `wayland` value. Run `hdr-ultimate --dev` to see the monitor list the app works from.
